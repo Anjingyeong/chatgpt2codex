@@ -14,7 +14,7 @@ Your source stays on your machine. ChatGPT connects to the local app you run.
 You choose the workspace, approve the token, and keep control of what gets
 edited.
 
-[Download the macOS installer](installers/macos/chatgpt2codex-0.1.1.pkg) ·
+[Download v0.1.2](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2) ·
 [Beginner installation guide](docs/INSTALL.md)
 
 > Help us get this in front of more builders: star the repo if you want
@@ -44,8 +44,8 @@ ChatGPT thinks. Your computer acts. You review the result.
 
 | Platform | Status | Package |
 | --- | --- | --- |
-| macOS | Public test release | `installers/macos/chatgpt2codex-0.1.1.pkg` |
-| Windows | Source/package build available, public installer not published yet | Build locally with `npm run windows:package` |
+| macOS | Public release | `chatgpt2codex-0.1.2.pkg` |
+| Windows | Public release | `chatgpt2codex-0.1.2-windows-setup.exe` |
 | Linux | Developer path only | Not published |
 
 ### Why PKG Instead Of DMG?
@@ -59,7 +59,7 @@ can still be added later for a more consumer-style download.
 Current macOS package SHA-256:
 
 ```text
-abfaea077fdc1f09b3130700a2e2072432ceb4ac240a2565b460c834740e5496  chatgpt2codex-0.1.1.pkg
+d9226ba10d9a24a121a0ec6c7a6c79f81d55b3bb60ddc5acd13240c2d17f7821  chatgpt2codex-0.1.2.pkg
 ```
 
 ## What ChatGPT Can Do With It
@@ -95,9 +95,9 @@ local folders.
 
 Full beginner guide: [docs/INSTALL.md](docs/INSTALL.md)
 
-Short version:
+macOS short version:
 
-1. Download `installers/macos/chatgpt2codex-0.1.1.pkg`.
+1. Download `chatgpt2codex-0.1.2.pkg` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2).
 2. Open the installer.
 3. If macOS blocks the unsigned package, Control-click it, choose **Open**, and
    confirm in **System Settings** -> **Privacy & Security** if needed.
@@ -109,6 +109,17 @@ Short version:
 9. Click **Copy Connector URL**.
 10. Register that `/mcp` URL in ChatGPT Apps / Connectors and approve with the
     Owner Token shown by the app.
+
+Windows short version:
+
+1. Download `chatgpt2codex-0.1.2-windows-setup.exe` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2).
+2. Double-click the installer.
+3. If Windows SmartScreen warns, choose **More info** -> **Run anyway** only if
+   the file came from this GitHub release.
+4. Launch **ChatGPT To Codex**.
+5. Open the tray icon settings, choose your project folder, enable the ChatGPT
+   web connector if needed, then click **Start MCP**.
+6. Copy the `/mcp` Connector URL and approve it in ChatGPT with the Owner Token.
 
 Keep the Owner Token private. Treat it like a password.
 
@@ -155,10 +166,10 @@ Chinese. More documentation languages are welcome.
 
 ## Windows Status
 
-Windows support now includes the tray launcher, local installer/package build,
-owner-token setup flow, ChatGPT web connector settings, and Windows E2E
-screenshot proof. A public beginner installer has not been published yet; build
-it locally with `npm run windows:package`.
+Windows now has a public beginner installer. It includes the tray launcher,
+owner-token setup flow, ChatGPT web connector settings, stale runtime cleanup,
+and Windows E2E screenshot proof. See [docs/INSTALL.md](docs/INSTALL.md) and
+[windows/README.md](windows/README.md) for the full Windows guide.
 
 ## Repository Contents
 
