@@ -1,0 +1,133 @@
+import { exec } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { DomainError, ErrorCode } from "../types.js";
+import { redact } from "../policy/secrets.js";
+import { resolveInProject } from "../policy/paths.js";
+import { buildSafeChildEnv } from "./command-runner.js";
+
+const DEFAULT_TIMEOUT_SEC = 60;
+const MAX_TIMEOUT_SEC = 900;
+const OUTPUT_HEAD_BYTES = 12_000;
+const OUTPUT_TAIL_BYTES = 6_000;
+
+const SECRET_COMMAND_PATTERNS = [
+  /(^|[\s/"'])\.env([\s/"'.]|$)/i,
+  /(^|[\s/"'])\.ssh([\s/"']|$)/i,
+  /(^|[\s/"'])\.npmrc([\s/"']|$)/i,
+  /id_rsa|id_ed25519|private[_-]?key/i,
+  /security\s+find-(generic|internet)-password/i,
+  /keychain/i,
+];
+
+const OS_DESTRUCTIVE_PATTERNS = [
+  /\bsudo\b/i,
+  /\brm\s+-[^;\n]*r[^;\n]*f[^;\n]*\//i,
+  /\bdiskutil\s+erase/i,
+  /\bmkfs\b/i,
+  /\bshutdown\b|\breboot\b/i,
+];
+
+function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
+  const limit = OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES;
+  if (buf.length <= limit) {
+    return { text: buf.toString("utf8"), truncated: false };
+  }
+  const head = buf.subarray(0, OUTPUT_HEAD_BYTES).toString("utf8");
+  const tail = buf.subarray(buf.length - OUTPUT_TAIL_BYTES).toString("utf8");
+  return {
+    text: `${head}\n...[truncated ${buf.length - limit} bytes]...\n${tail}`,
+    truncated: true,
+  };
+}
+
+export function guardShellCommand(command: string): void {
+  for (const pattern of SECRET_COMMAND_PATTERNS) {
+    if (pattern.test(command)) {
+      throw new DomainError(
+        ErrorCode.SECRET_BLOCKED,
+        "local_shell_run blocked a command that appears to read secret-classified material",
+      );
+    }
+  }
+  for (const pattern of OS_DESTRUCTIVE_PATTERNS) {
+    if (pattern.test(command)) {
+      throw new DomainError(
+        ErrorCode.APPROVAL_REQUIRED,
+        "local_shell_run blocked an OS-level destructive command",
+      );
+    }
+  }
+}
+
+export async function runLocalShell(
+  root: string,
+  command: string,
+  cwd?: string,
+  timeoutSec?: number,
+): Promise<{
+  cwd: string;
+  exitCode: number;
+  stdoutSummary: string;
+  stderrSummary: string;
+  durationMs: number;
+  outputTruncated: boolean;
+}> {
+  guardShellCommand(command);
+
+  const baseRoot = await fs.realpath(root);
+  const commandCwd = cwd
+    ? await resolveInProject(baseRoot, cwd, { allowSymlink: false })
+    : baseRoot;
+  const stat = await fs.stat(commandCwd).catch(() => null);
+  if (!stat?.isDirectory()) {
+    throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "cwd is not a project directory", {
+      cwd,
+    });
+  }
+
+  const requestedTimeout = timeoutSec ?? DEFAULT_TIMEOUT_SEC;
+  const effectiveTimeoutSec = Math.min(Math.max(requestedTimeout, 1), MAX_TIMEOUT_SEC);
+  const start = Date.now();
+
+  return await new Promise((resolve, reject) => {
+    exec(
+      command,
+      {
+        cwd: commandCwd,
+        env: buildSafeChildEnv(),
+        timeout: effectiveTimeoutSec * 1000,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * 1024 * 1024,
+        windowsHide: true,
+      },
+      (error, stdout, stderr) => {
+        const durationMs = Date.now() - start;
+        const stdoutBuf = Buffer.from(stdout ?? "", "utf8");
+        const stderrBuf = Buffer.from(stderr ?? "", "utf8");
+
+        if (error && (error as NodeJS.ErrnoException & { killed?: boolean }).killed) {
+          reject(
+            new DomainError(ErrorCode.TIMEOUT, `local shell command timed out after ${effectiveTimeoutSec}s`, {
+              timeoutSec: effectiveTimeoutSec,
+            }),
+          );
+          return;
+        }
+
+        const outStd = truncateOutput(stdoutBuf);
+        const outErr = truncateOutput(stderrBuf);
+        const exitCode = typeof error?.code === "number" ? error.code : error ? 1 : 0;
+
+        resolve({
+          cwd: path.relative(baseRoot, commandCwd) || ".",
+          exitCode,
+          stdoutSummary: redact(outStd.text),
+          stderrSummary: redact(outErr.text),
+          durationMs,
+          outputTruncated: outStd.truncated || outErr.truncated,
+        });
+      },
+    );
+  });
+}

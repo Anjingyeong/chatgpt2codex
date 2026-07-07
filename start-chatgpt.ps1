@@ -1,0 +1,304 @@
+param(
+    [string]$Workspace = $env:WORKSPACE,
+    [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 7979 }),
+    [string]$PublicHostname = $env:PUBLIC_HOSTNAME,
+    [string]$ActiveProjectRoot = $env:CHATGPT2CODEX_ACTIVE_PROJECT_ROOT,
+    [string]$ActiveProjectPreset = $(if ($env:CHATGPT2CODEX_ACTIVE_PROJECT_PRESET) { $env:CHATGPT2CODEX_ACTIVE_PROJECT_PRESET } else { "full-write" }),
+    [switch]$ExposeWeb,
+    [switch]$RotateOwnerToken
+)
+
+$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
+$userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+$nodePath = Join-Path $env:ProgramFiles "nodejs"
+$cloudflaredPath = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe"
+$env:PATH = "$Root\bin;$nodePath;$cloudflaredPath;$env:USERPROFILE\.local\bin;$machinePath;$userPath;$env:PATH"
+
+if (-not $Workspace) {
+    $Workspace = Join-Path $HOME "workspace"
+}
+New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
+$Workspace = [System.IO.Path]::GetFullPath($Workspace)
+
+$cloudflaredName = $env:CLOUDFLARED_TUNNEL_NAME
+$cloudflaredToken = $env:CLOUDFLARED_TUNNEL_TOKEN
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "chatgpt2codex"
+New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+$cfOut = Join-Path $tempRoot "cloudflared.out.log"
+$cfErr = Join-Path $tempRoot "cloudflared.err.log"
+$srvOut = Join-Path $tempRoot "server.out.log"
+$srvErr = Join-Path $tempRoot "server.err.log"
+
+function Need-Command([string]$Name) {
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Missing command: $Name"
+    }
+}
+
+function Quote-Arg([string]$Value) {
+    if ($Value -match '^[A-Za-z0-9_\-.:/\\=]+$') {
+        return $Value
+    }
+    return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
+}
+
+function Start-LoggedProcess([string]$File, [string[]]$ArgumentList, [string]$Stdout, [string]$Stderr) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $Stdout, $Stderr
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $File
+    $psi.Arguments = (($ArgumentList | ForEach-Object { Quote-Arg $_ }) -join " ")
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $process.Start() | Out-Null
+    Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -MessageData $Stdout -Action {
+        if ($EventArgs.Data) { Add-Content -Path $Event.MessageData -Value $EventArgs.Data }
+    } | Out-Null
+    Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -MessageData $Stderr -Action {
+        if ($EventArgs.Data) { Add-Content -Path $Event.MessageData -Value $EventArgs.Data }
+    } | Out-Null
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+    return $process
+}
+
+function Test-PortBusy([int]$PortToCheck) {
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), $PortToCheck)
+        $listener.Start()
+        return $false
+    } catch {
+        return $true
+    } finally {
+        if ($listener) { $listener.Stop() }
+    }
+}
+
+function Wait-HttpOk([string]$Url, [int]$Tries, [string]$Label) {
+    for ($i = 0; $i -lt $Tries; $i++) {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri $Url
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                return
+            }
+        } catch {
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "$Label did not become ready: $Url"
+}
+
+function Resolve-HostWithCloudflareDoh([string]$HostName) {
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) { return @() }
+
+    try {
+        $queryUrl = "https://cloudflare-dns.com/dns-query?name=$([System.Uri]::EscapeDataString($HostName))&type=A"
+        $jsonText = & curl.exe --silent --show-error --resolve "cloudflare-dns.com:443:1.1.1.1" -H "accept: application/dns-json" --max-time 20 $queryUrl
+        if ($LASTEXITCODE -ne 0) { return @() }
+        $json = ($jsonText -join "`n") | ConvertFrom-Json
+        return @($json.Answer | Where-Object { $_.type -eq 1 -and $_.data } | ForEach-Object { [string]$_.data })
+    } catch {
+        return @()
+    }
+}
+
+function Test-HttpOkWithCurlResolve([string]$Url) {
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) { return $false }
+
+    try {
+        $uri = [System.Uri]::new($Url)
+        if ($uri.Scheme -ne "https") { return $false }
+        $ips = Resolve-HostWithCloudflareDoh $uri.Host
+        foreach ($ip in $ips) {
+            $resolve = "$($uri.Host):443:$ip"
+            $output = & curl.exe --silent --show-error --resolve $resolve --max-time 20 --write-out "`nHTTP_STATUS:%{http_code}" $Url
+            $text = ($output -join "`n")
+            $statusMatch = [regex]::Match($text, "HTTP_STATUS:(\d+)")
+            $status = if ($statusMatch.Success) { [int]$statusMatch.Groups[1].Value } else { 0 }
+            if ($LASTEXITCODE -eq 0 -and $status -ge 200 -and $status -lt 300) {
+                return $true
+            }
+        }
+    } catch {
+    }
+    return $false
+}
+
+function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label) {
+    for ($i = 0; $i -lt $Tries; $i++) {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri $Url
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                return
+            }
+        } catch {
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "$Label did not become ready: $Url"
+}
+
+function Get-QuickTunnelUrl {
+    $text = ""
+    foreach ($path in @($cfOut, $cfErr)) {
+        if (Test-Path $path) {
+            $text += "`n" + (Get-Content -Raw -ErrorAction SilentlyContinue $path)
+        }
+    }
+    $matches = [regex]::Matches($text, 'https://[A-Za-z0-9.-]+\.trycloudflare\.com')
+    if ($matches.Count -gt 0) {
+        return $matches[0].Value
+    }
+    return $null
+}
+
+function Wait-QuickTunnelUrl([System.Diagnostics.Process]$Process, [int]$Tries) {
+    for ($i = 0; $i -lt $Tries; $i++) {
+        $url = Get-QuickTunnelUrl
+        if ($url) { return $url }
+        if ($Process.HasExited) {
+            throw "cloudflared exited early. See $cfOut and $cfErr"
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "Quick Tunnel URL did not appear. See $cfOut and $cfErr"
+}
+
+function Start-QuickTunnelWithRetry([int]$Attempts) {
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if ($attempt -gt 1) {
+            Write-Host "[chatgpt2codex] retrying public tunnel ($attempt/$Attempts)..."
+            Start-Sleep -Seconds ([Math]::Min(10, 2 * $attempt))
+        }
+
+        $process = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:$Port") $cfOut $cfErr
+        try {
+            $url = Wait-QuickTunnelUrl $process 45
+            return [pscustomobject]@{ Process = $process; Url = $url }
+        } catch {
+            $lastError = $_
+            Stop-Child $process
+        }
+    }
+
+    if ($lastError) { throw $lastError }
+    throw "Quick Tunnel URL did not appear. See $cfOut and $cfErr"
+}
+
+function Stop-Child([System.Diagnostics.Process]$Process) {
+    if ($Process -and -not $Process.HasExited) {
+        try { $Process.Kill($true) } catch { try { $Process.Kill() } catch {} }
+    }
+}
+
+Need-Command node
+Set-Location $Root
+
+if (-not (Test-Path (Join-Path $Root "dist\cli.js"))) {
+    Need-Command npm
+    Write-Host "[chatgpt2codex] dist/cli.js missing; building..."
+    npm run build
+}
+
+if (Test-PortBusy $Port) {
+    throw "Port $Port is already in use. Set PORT or stop the other process."
+}
+
+$cli = Join-Path $Root "dist\cli.js"
+$doctor = node $cli doctor 2>$null
+if (($doctor -join "`n") -notmatch "owner token configured") {
+    throw "Owner token is not configured. Open ChatGPT To Codex settings and generate or set an owner token first."
+}
+
+$cfProc = $null
+$srvProc = $null
+try {
+    $useTunnel = $ExposeWeb -or $env:CHATGPT2CODEX_EXPOSE_WEB -eq "1" -or $PublicHostname -or $cloudflaredToken -or $cloudflaredName
+    $idleShutdownMinutes = $env:CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES
+    if ($useTunnel) {
+        Need-Command cloudflared
+        Write-Host "[chatgpt2codex] 1/3 starting public tunnel..."
+        if ($cloudflaredToken -or $cloudflaredName) {
+            if (-not $PublicHostname) {
+                throw "PUBLIC_HOSTNAME is required with CLOUDFLARED_TUNNEL_TOKEN or CLOUDFLARED_TUNNEL_NAME."
+            }
+            $publicUrl = "https://$PublicHostname"
+            if ($cloudflaredToken) {
+                $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--token", $cloudflaredToken) $cfOut $cfErr
+            } else {
+                $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--url", "http://127.0.0.1:$Port", $cloudflaredName) $cfOut $cfErr
+            }
+        } elseif ($PublicHostname) {
+            $publicUrl = "https://$PublicHostname"
+            $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--hostname", $PublicHostname, "--url", "http://127.0.0.1:$Port", "--no-autoupdate") $cfOut $cfErr
+        } else {
+            $quickTunnel = Start-QuickTunnelWithRetry 4
+            $cfProc = $quickTunnel.Process
+            $publicUrl = $quickTunnel.Url
+        }
+    } else {
+        $publicUrl = "http://127.0.0.1:$Port"
+        Write-Host "[chatgpt2codex] 1/2 loopback-only mode; no public tunnel."
+    }
+
+    Write-Host "[chatgpt2codex] 2/3 starting local HTTP/OAuth MCP server..."
+    $serverArgs = @($cli, "serve", "--http", "--port", "$Port", "--public-url", $publicUrl, "--workspace", $Workspace)
+    if ($idleShutdownMinutes) {
+        $serverArgs += @("--idle-shutdown-minutes", "$idleShutdownMinutes")
+    }
+    if ($ActiveProjectRoot) {
+        $serverArgs += @("--active-project-root", $ActiveProjectRoot, "--active-project-preset", $ActiveProjectPreset)
+    }
+    $srvProc = Start-LoggedProcess "node" $serverArgs $srvOut $srvErr
+    Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
+
+    if ($useTunnel) {
+        Write-Host "[chatgpt2codex] 3/3 checking public health..."
+        Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint"
+    }
+
+    Write-Host ""
+    Write-Host "============================================================"
+    Write-Host " ChatGPT To Codex is ready"
+    Write-Host "============================================================"
+    Write-Host " MCP URL:"
+    Write-Host ""
+    Write-Host "   $publicUrl/mcp"
+    Write-Host ""
+    Write-Host " Notes:"
+    Write-Host "   - Keep this window or tray app running."
+    Write-Host "   - Default mode is loopback-only and is not reachable from ChatGPT web."
+    Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
+    Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
+    if ($useTunnel -and -not $PublicHostname -and -not $cloudflaredToken -and -not $cloudflaredName) {
+        Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
+        Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
+    }
+    Write-Host "   - If the owner token appeared in a chat/screenshot, rotate it."
+    Write-Host "============================================================"
+
+    while ($true) {
+        if ($srvProc.HasExited) {
+            if ($srvProc.ExitCode -eq 0) {
+                Write-Host "[chatgpt2codex] server stopped."
+                break
+            }
+            throw "server exited. See $srvOut and $srvErr"
+        }
+        if ($useTunnel -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
+        Start-Sleep -Seconds 1
+    }
+} finally {
+    Stop-Child $srvProc
+    Stop-Child $cfProc
+}
