@@ -8,7 +8,7 @@ SHA-256:
 abfaea077fdc1f09b3130700a2e2072432ceb4ac240a2565b460c834740e5496  chatgpt2codex-0.1.1.pkg
 ```
 
-Windows is still being tested and is not recommended for beginner installs yet.
+Windows can be built from source; a public beginner installer has not been published yet.
 
 ## Korean
 
@@ -64,7 +64,7 @@ macOS 권한이 필요할 수 있습니다.
 
 - Owner Token은 비밀번호처럼 다루세요.
 - 임시 `trycloudflare.com` 주소는 앱이나 터널을 재시작하면 바뀔 수 있습니다.
-- Windows 설치파일은 아직 공개 초보자용이 아닙니다.
+- Windows는 소스에서 빌드할 수 있지만, 공개 초보자용 설치파일은 아직 배포되지 않았습니다.
 
 ## English
 
@@ -104,7 +104,7 @@ macOS may ask for Screen Recording and Accessibility permissions. Enable them in
 
 - Keep the Owner Token private.
 - Temporary `trycloudflare.com` URLs can change after restart.
-- Windows is still in testing and is not the beginner path yet.
+- Windows can be built from source, but the public beginner installer is not published yet.
 
 ## Japanese
 
@@ -142,7 +142,7 @@ Screen Recording と Accessibility 権限が必要になる場合があります
 
 - Owner Token は公開しないでください。
 - 一時的な `trycloudflare.com` URL は再起動後に変わることがあります。
-- Windows 版はまだテスト中です。
+- Windows 版はソースからビルドできますが、初心者向けの公開インストーラはまだありません。
 
 ## Simplified Chinese
 
@@ -182,4 +182,4 @@ macOS 可能需要 Screen Recording 和 Accessibility 权限。
 
 - 请不要公开 Owner Token。
 - 临时 `trycloudflare.com` 地址重启后可能变化。
-- Windows 版本仍在测试中。
+- Windows 版可以从源码构建，但面向新手的公开安装包尚未发布。

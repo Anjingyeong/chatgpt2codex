@@ -1,6 +1,7 @@
 import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { DomainError, ErrorCode } from "../types.js";
@@ -55,6 +56,230 @@ function appleScriptString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+function powerShellExe(): string {
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  if (systemRoot) {
+    return path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  }
+  return "powershell.exe";
+}
+
+function cmdExe(): string {
+  return process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe";
+}
+
+function shellInvocation(command: string): { file: string; args: string[] } {
+  if (process.platform === "win32") {
+    return { file: cmdExe(), args: ["/d", "/s", "/c", command] };
+  }
+  if (process.platform === "darwin") {
+    return { file: "/bin/zsh", args: ["-lc", command] };
+  }
+  return { file: process.env.SHELL ?? "/bin/sh", args: ["-lc", command] };
+}
+
+async function execPowerShell(script: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-ps-"));
+  const scriptPath = path.join(dir, "script.ps1");
+  try {
+    await fs.writeFile(scriptPath, script, "utf8");
+    return await execFileAsync(powerShellExe(), [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      ...args,
+    ]);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+const WINDOWS_SCREENSHOT_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$out = $args[0]
+if ([string]::IsNullOrWhiteSpace($out)) { throw 'missing output path' }
+$dir = [System.IO.Path]::GetDirectoryName($out)
+if ($dir) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }
+if ($args.Length -ge 5) {
+  $x = [int]$args[1]
+  $y = [int]$args[2]
+  $width = [int]$args[3]
+  $height = [int]$args[4]
+} else {
+  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $x = $bounds.X
+  $y = $bounds.Y
+  $width = $bounds.Width
+  $height = $bounds.Height
+}
+if ($width -le 0 -or $height -le 0) { throw 'invalid screenshot bounds' }
+$bitmap = [System.Drawing.Bitmap]::new($width, $height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+try {
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  try {
+    $graphics.CopyFromScreen($x, $y, 0, 0, [System.Drawing.Size]::new($width, $height), [System.Drawing.CopyPixelOperation]::SourceCopy)
+  } finally {
+    $graphics.Dispose()
+  }
+  $bitmap.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+} finally {
+  $bitmap.Dispose()
+}
+`;
+
+const WINDOWS_JPEG_PREVIEW_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$sourcePath = $args[0]
+$destPath = $args[1]
+$maxDim = [int]$args[2]
+$quality = [long]$args[3]
+$source = [System.Drawing.Image]::FromFile($sourcePath)
+try {
+  $largest = [Math]::Max([double]$source.Width, [double]$source.Height)
+  $scale = [double]$maxDim / $largest
+  if ($scale -gt 1.0) { $scale = 1.0 }
+  $width = [Math]::Max(1, [int][Math]::Round($source.Width * $scale))
+  $height = [Math]::Max(1, [int][Math]::Round($source.Height * $scale))
+  $dest = [System.Drawing.Bitmap]::new($width, $height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+  try {
+    $graphics = [System.Drawing.Graphics]::FromImage($dest)
+    try {
+      $graphics.Clear([System.Drawing.Color]::White)
+      $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+      $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+      $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+      $graphics.DrawImage($source, 0, 0, $width, $height)
+    } finally {
+      $graphics.Dispose()
+    }
+    $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+    if (-not $codec) { throw 'jpeg codec not found' }
+    $encoderParams = [System.Drawing.Imaging.EncoderParameters]::new(1)
+    try {
+      $encoderParams.Param[0] = [System.Drawing.Imaging.EncoderParameter]::new([System.Drawing.Imaging.Encoder]::Quality, $quality)
+      $dest.Save($destPath, $codec, $encoderParams)
+    } finally {
+      $encoderParams.Dispose()
+    }
+  } finally {
+    $dest.Dispose()
+  }
+} finally {
+  $source.Dispose()
+}
+`;
+
+const WINDOWS_WINDOW_REGION_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class ChatGPTToCodexWin32Bounds {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT {
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+  }
+  [DllImport("user32.dll")]
+  public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+"@
+$needle = [string]$args[0]
+if ([string]::IsNullOrWhiteSpace($needle)) { throw 'missing app name' }
+$needleLower = $needle.ToLowerInvariant()
+$proc = Get-Process | Where-Object {
+  $_.MainWindowHandle -ne 0 -and (
+    $_.ProcessName.ToLowerInvariant().Contains($needleLower) -or
+    ([string]$_.MainWindowTitle).ToLowerInvariant().Contains($needleLower)
+  )
+} | Sort-Object StartTime -Descending | Select-Object -First 1
+if (-not $proc) { throw "app window not found: $needle" }
+[void][ChatGPTToCodexWin32Bounds]::SetForegroundWindow($proc.MainWindowHandle)
+Start-Sleep -Milliseconds 250
+$rect = [ChatGPTToCodexWin32Bounds+RECT]::new()
+if (-not [ChatGPTToCodexWin32Bounds]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)) { throw 'could not read window bounds' }
+$width = $rect.Right - $rect.Left
+$height = $rect.Bottom - $rect.Top
+if ($width -le 0 -or $height -le 0) { throw 'invalid app window bounds' }
+"$($rect.Left),$($rect.Top),$width,$height"
+`;
+
+const WINDOWS_START_PROCESS_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$file = [string]$args[0]
+$rest = @()
+if ($args.Length -gt 1) { $rest = $args[1..($args.Length - 1)] }
+if ($rest.Count -gt 0) {
+  Start-Process -FilePath $file -ArgumentList $rest
+} else {
+  Start-Process -FilePath $file
+}
+`;
+
+const WINDOWS_SEND_KEYS_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject WScript.Shell
+Start-Sleep -Milliseconds 150
+$shell.SendKeys([string]$args[0])
+Start-Sleep -Milliseconds 350
+`;
+
+function parseRegion(region: string): { x: number; y: number; width: number; height: number } {
+  const parts = region.split(",").map((part) => Number.parseInt(part.trim(), 10));
+  if (parts.length !== 4 || parts.some((part) => !Number.isFinite(part))) {
+    throw new Error(`invalid screenshot region: ${region}`);
+  }
+  const [x, y, width, height] = parts as [number, number, number, number];
+  if (width <= 0 || height <= 0) {
+    throw new Error(`invalid screenshot region: ${region}`);
+  }
+  return { x, y, width, height };
+}
+
+async function captureWindowsScreenshot(file: string, region?: { x: number; y: number; width: number; height: number }): Promise<void> {
+  const args = region ? [file, String(region.x), String(region.y), String(region.width), String(region.height)] : [file];
+  await execPowerShell(WINDOWS_SCREENSHOT_SCRIPT, args);
+}
+
+async function openFileForUser(file: string): Promise<void> {
+  if (process.platform === "darwin") {
+    await execFileAsync("/usr/bin/open", [file]);
+    return;
+  }
+  if (process.platform === "win32") {
+    await execPowerShell(WINDOWS_START_PROCESS_SCRIPT, [file]);
+    return;
+  }
+  await execFileAsync("xdg-open", [file]);
+}
+
+async function startWindowsProcess(file: string, args: string[] = []): Promise<void> {
+  await execPowerShell(WINDOWS_START_PROCESS_SCRIPT, [file, ...args]);
+}
+
+async function getWindowsAppWindowRegion(appName: string): Promise<string> {
+  const { stdout } = await execPowerShell(WINDOWS_WINDOW_REGION_SCRIPT, [appName]);
+  const parts = stdout.match(/-?\d+/g);
+  if (!parts || parts.length < 4) {
+    throw new Error(`invalid app window bounds: ${stdout.trim()}`);
+  }
+  return parts.slice(0, 4).join(",");
+}
+
+async function scrollWindowsActiveWindow(fraction: number): Promise<void> {
+  await execPowerShell(WINDOWS_SEND_KEYS_SCRIPT, [fraction >= 1 ? "{END}" : "{PGDN}"]);
+}
+
 async function captureRegionScreenshot(
   projectRoot: string,
   input: {
@@ -71,18 +296,26 @@ async function captureRegionScreenshot(
   const dir = path.join(await e2eDir(root), "screenshots");
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${Date.now()}-${slug(input.label)}.png`);
-  await execFileAsync("/usr/sbin/screencapture", ["-x", "-R", input.region, file]);
+  if (process.platform === "darwin") {
+    await execFileAsync("/usr/sbin/screencapture", ["-x", "-R", input.region, file]);
+  } else if (process.platform === "win32") {
+    await captureWindowsScreenshot(file, parseRegion(input.region));
+  } else {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Region E2E screenshots are currently supported on macOS and Windows");
+  }
   const stat = await fs.stat(file);
   if (stat.size === 0) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
-      { permission: "screen-recording" },
+      process.platform === "win32"
+        ? "Windows E2E screenshot capture produced an empty file. Make sure the desktop session is unlocked and try again."
+        : "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      { permission: process.platform === "win32" ? "desktop-capture" : "screen-recording" },
     );
   }
   const opened = input.openAfterCapture === true;
   if (opened) {
-    await execFileAsync("/usr/bin/open", [file]);
+    await openFileForUser(file);
   }
   return {
     path: file,
@@ -153,6 +386,23 @@ async function scrollChromePage(fraction: number): Promise<void> {
   ]);
 }
 
+async function scrollBrowserPage(fraction: number): Promise<void> {
+  if (process.platform === "win32") {
+    await scrollWindowsActiveWindow(fraction);
+    return;
+  }
+  await scrollChromePage(fraction);
+}
+
+async function scrollTargetAppWindow(appName: string): Promise<void> {
+  if (process.platform === "win32") {
+    await getWindowsAppWindowRegion(appName);
+    await scrollWindowsActiveWindow(0.5);
+    return;
+  }
+  await scrollAppWindow(appName);
+}
+
 async function waitForUrl(url: string, timeoutSec: number): Promise<{ ok: boolean; status?: number; error?: string; elapsedMs: number }> {
   const started = Date.now();
   const deadline = started + timeoutSec * 1000;
@@ -203,10 +453,12 @@ export async function startE2eServer(
   const runId = e2eId(input.command);
   const logPath = path.join(dir, `${runId}-${slug(input.label ?? "server")}.log`);
   const out = await fs.open(logPath, "a");
-  const child = spawn("/bin/zsh", ["-lc", input.command], {
+  const invocation = shellInvocation(input.command);
+  const child = spawn(invocation.file, invocation.args, {
     cwd: commandCwd,
     env: buildSafeChildEnv(),
     detached: true,
+    windowsHide: true,
     stdio: ["ignore", out.fd, out.fd],
   });
   child.unref();
@@ -227,8 +479,12 @@ export async function stopE2eServer(input: { pid: number }): Promise<{ stopped: 
     return { stopped: false, error: "missing pid" };
   }
   try {
-    process.kill(-input.pid, "SIGTERM");
-    await delay(500);
+    if (process.platform === "win32") {
+      await execFileAsync("taskkill.exe", ["/pid", String(input.pid), "/t", "/f"]).catch(() => ({ stdout: "", stderr: "" }));
+    } else {
+      process.kill(-input.pid, "SIGTERM");
+      await delay(500);
+    }
     return { stopped: true };
   } catch (error) {
     return { stopped: false, error: summarizeE2eError(error) };
@@ -238,16 +494,54 @@ export async function stopE2eServer(input: { pid: number }): Promise<{ stopped: 
 export async function openE2eTarget(input: { url?: string; appName?: string; appPath?: string; args?: string[] }): Promise<{
   launched: string;
 }> {
+  if (process.platform === "win32") {
+    if (input.url) {
+      await startWindowsProcess(input.url);
+      return { launched: input.url };
+    }
+    if (input.appPath) {
+      await startWindowsProcess(input.appPath, input.args);
+      return { launched: input.appPath };
+    }
+    if (input.appName) {
+      await startWindowsProcess(input.appName, input.args);
+      return { launched: input.appName };
+    }
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Provide url, appName, or appPath");
+  }
+
   if (input.url) {
-    await execFileAsync("/usr/bin/open", [input.url]);
+    if (process.platform === "darwin") {
+      await execFileAsync("/usr/bin/open", [input.url]);
+    } else {
+      await execFileAsync("xdg-open", [input.url]);
+    }
     return { launched: input.url };
   }
   if (input.appPath) {
-    await execFileAsync("/usr/bin/open", [input.appPath, ...(input.args?.length ? ["--args", ...input.args] : [])]);
+    if (process.platform === "darwin") {
+      await execFileAsync("/usr/bin/open", [input.appPath, ...(input.args?.length ? ["--args", ...input.args] : [])]);
+    } else {
+      const child = spawn(input.appPath, input.args ?? [], {
+        detached: true,
+        env: buildSafeChildEnv(),
+        stdio: "ignore",
+      });
+      child.unref();
+    }
     return { launched: input.appPath };
   }
   if (input.appName) {
-    await execFileAsync("/usr/bin/open", ["-a", input.appName, ...(input.args?.length ? ["--args", ...input.args] : [])]);
+    if (process.platform === "darwin") {
+      await execFileAsync("/usr/bin/open", ["-a", input.appName, ...(input.args?.length ? ["--args", ...input.args] : [])]);
+    } else {
+      const child = spawn(input.appName, input.args ?? [], {
+        detached: true,
+        env: buildSafeChildEnv(),
+        stdio: "ignore",
+      });
+      child.unref();
+    }
     return { launched: input.appName };
   }
   throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Provide url, appName, or appPath");
@@ -275,19 +569,25 @@ export async function createE2eScreenshotPreview(screenshotPath: string): Promis
   try {
     const existing = await fs.stat(previewPath).catch(() => null);
     if (!existing?.isFile() || existing.size === 0) {
-      await execFileAsync("/usr/bin/sips", [
-        "--resampleHeightWidthMax",
-        PREVIEW_MAX_DIMENSION,
-        "-s",
-        "format",
-        "jpeg",
-        "-s",
-        "formatOptions",
-        PREVIEW_JPEG_QUALITY,
-        screenshotPath,
-        "--out",
-        previewPath,
-      ]);
+      if (process.platform === "darwin") {
+        await execFileAsync("/usr/bin/sips", [
+          "--resampleHeightWidthMax",
+          PREVIEW_MAX_DIMENSION,
+          "-s",
+          "format",
+          "jpeg",
+          "-s",
+          "formatOptions",
+          PREVIEW_JPEG_QUALITY,
+          screenshotPath,
+          "--out",
+          previewPath,
+        ]);
+      } else if (process.platform === "win32") {
+        await execPowerShell(WINDOWS_JPEG_PREVIEW_SCRIPT, [screenshotPath, previewPath, PREVIEW_MAX_DIMENSION, PREVIEW_JPEG_QUALITY]);
+      } else {
+        return null;
+      }
     }
     const stat = await fs.stat(previewPath);
     if (!stat.isFile() || stat.size === 0) return null;
@@ -301,8 +601,8 @@ export async function captureE2eScreenshot(
   projectRoot: string,
   input: { label?: string; waitMs?: number; openAfterCapture?: boolean },
 ): Promise<E2eScreenshotResult> {
-  if (process.platform !== "darwin") {
-    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "screencapture-based E2E screenshots are currently supported on macOS");
+  if (process.platform !== "darwin" && process.platform !== "win32") {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "E2E screenshots are currently supported on macOS and Windows");
   }
   if (input.waitMs && input.waitMs > 0) {
     await delay(Math.min(input.waitMs, 30_000));
@@ -312,25 +612,36 @@ export async function captureE2eScreenshot(
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${Date.now()}-${slug(input.label ?? "screen")}.png`);
   try {
-    await execFileAsync("/usr/sbin/screencapture", ["-x", file]);
+    if (process.platform === "darwin") {
+      await execFileAsync("/usr/sbin/screencapture", ["-x", file]);
+    } else {
+      await captureWindowsScreenshot(file);
+    }
   } catch (error) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
-      { permission: "screen-recording", cause: summarizeE2eError(error) },
+      process.platform === "win32"
+        ? "Windows E2E screenshot capture failed. Make sure the desktop session is unlocked and try again."
+        : "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      {
+        permission: process.platform === "win32" ? "desktop-capture" : "screen-recording",
+        cause: summarizeE2eError(error),
+      },
     );
   }
   const stat = await fs.stat(file);
   if (stat.size === 0) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
-      { permission: "screen-recording" },
+      process.platform === "win32"
+        ? "Windows E2E screenshot capture produced an empty file. Make sure the desktop session is unlocked and try again."
+        : "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      { permission: process.platform === "win32" ? "desktop-capture" : "screen-recording" },
     );
   }
   const opened = input.openAfterCapture === true;
   if (opened) {
-    await execFileAsync("/usr/bin/open", [file]);
+    await openFileForUser(file);
   }
   return { path: file, bytes: stat.size, opened, captureMode: "screen" };
 }
@@ -348,13 +659,29 @@ export async function captureE2eUrlScreenshot(
     height?: number;
   },
 ): Promise<E2eScreenshotResult> {
-  if (process.platform !== "darwin") {
-    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "browser-region E2E screenshots are currently supported on macOS");
-  }
   const x = input.x ?? 80;
   const y = input.y ?? 80;
   const width = input.width ?? 1440;
   const height = input.height ?? 900;
+
+  if (process.platform === "win32") {
+    await openE2eTarget({ url: input.url });
+    if (input.waitMs && input.waitMs > 0) {
+      await delay(Math.min(input.waitMs, 30_000));
+    }
+    return captureRegionScreenshot(projectRoot, {
+      label: input.label ?? "url",
+      region: `${x},${y},${width},${height}`,
+      openAfterCapture: input.openAfterCapture,
+      captureMode: "browser-region",
+      targetUrl: input.url,
+      shotLabel: input.label,
+    });
+  }
+
+  if (process.platform !== "darwin") {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Browser-region E2E screenshots are currently supported on macOS and Windows");
+  }
 
   try {
     const right = x + width;
@@ -422,7 +749,7 @@ export async function captureE2eUrlScreenshotSet(
     ["bottom", 1],
   ] as const) {
     try {
-      await scrollChromePage(fraction);
+      await scrollBrowserPage(fraction);
       await delay(input.waitMs ?? 900);
       shots.push(
         await captureRegionScreenshot(projectRoot, {
@@ -439,7 +766,7 @@ export async function captureE2eUrlScreenshotSet(
     }
   }
   if (input.openAfterCapture && shots[0]) {
-    await execFileAsync("/usr/bin/open", [shots[0].path]);
+    await openFileForUser(shots[0].path);
     shots[0].opened = true;
   }
   return shots;
@@ -454,8 +781,8 @@ export async function captureE2eAppScreenshot(
     openAfterCapture?: boolean;
   },
 ): Promise<E2eScreenshotResult> {
-  if (process.platform !== "darwin") {
-    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "app-window E2E screenshots are currently supported on macOS");
+  if (process.platform !== "darwin" && process.platform !== "win32") {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "App-window E2E screenshots are currently supported on macOS and Windows");
   }
   if (input.waitMs && input.waitMs > 0) {
     await delay(Math.min(input.waitMs, 30_000));
@@ -463,12 +790,18 @@ export async function captureE2eAppScreenshot(
 
   let region = "";
   try {
-    region = await getAppWindowRegion(input.appName);
+    region = process.platform === "win32" ? await getWindowsAppWindowRegion(input.appName) : await getAppWindowRegion(input.appName);
   } catch (error) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      `macOS Accessibility permission is required to capture the ${input.appName} app window. Enable ChatGPT To Codex in System Settings > Privacy & Security > Accessibility, then retry.`,
-      { permission: "accessibility", appName: input.appName, cause: summarizeE2eError(error) },
+      process.platform === "win32"
+        ? `Could not find a visible Windows app window for ${input.appName}. Open the app and retry.`
+        : `macOS Accessibility permission is required to capture the ${input.appName} app window. Enable ChatGPT To Codex in System Settings > Privacy & Security > Accessibility, then retry.`,
+      {
+        permission: process.platform === "win32" ? "visible-window" : "accessibility",
+        appName: input.appName,
+        cause: summarizeE2eError(error),
+      },
     );
   }
 
@@ -501,7 +834,7 @@ export async function captureE2eAppScreenshotSet(
   );
   for (const shotLabel of ["middle", "bottom"] as const) {
     try {
-      await scrollAppWindow(input.appName);
+      await scrollTargetAppWindow(input.appName);
       await delay(input.waitMs ?? 900);
       shots.push(
         await captureE2eAppScreenshot(projectRoot, {
@@ -515,7 +848,7 @@ export async function captureE2eAppScreenshotSet(
     }
   }
   if (input.openAfterCapture && shots[0]) {
-    await execFileAsync("/usr/bin/open", [shots[0].path]);
+    await openFileForUser(shots[0].path);
     shots[0].opened = true;
   }
   return shots;

@@ -584,6 +584,24 @@ function isLocalHttpUrl(value: string | undefined): value is string {
   return typeof value === "string" && /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(value);
 }
 
+function isAllowedSystemAppPath(appPath: string): boolean {
+  if (process.platform === "darwin") {
+    return appPath.startsWith("/Applications/");
+  }
+  if (process.platform === "win32") {
+    const normalized = path.resolve(appPath).toLowerCase();
+    const roots = [
+      process.env.ProgramFiles,
+      process.env["ProgramFiles(x86)"],
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs") : undefined,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map((value) => path.resolve(value).toLowerCase());
+    return roots.some((root) => normalized === root || normalized.startsWith(`${root}${path.sep}`));
+  }
+  return false;
+}
+
 async function readPackageScripts(root: string, cwd?: string): Promise<{ scripts: Record<string, string>; source: string; commandCwd: string }> {
   const baseRoot = await fs.realpath(root);
   const commandCwd = cwd ? await resolveInProject(baseRoot, cwd, { allowSymlink: false }) : baseRoot;
@@ -830,7 +848,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "For GPT Image 2 requests: generate with ChatGPT's native image surface, then import the finished image with save_chatgpt_image, save_chatgpt_image_from_url, save_image_from_url, clipboard, download, or path.",
               "For device-agnostic/mobile ChatGPT images: use the ChatGPT Share/Copy Link/content URL and call save_chatgpt_image, save_chatgpt_image_from_url, or save_image_from_url.",
               "For Custom GPTs with native Image Generation enabled: install /actions/openapi.json as a GPT Action. That Actions bridge exposes source editing too: use project_select (preset defaults to full-write), code_search/file_read_slice, file_apply_patch/file_create, local_shell_run, repo/git actions. Do not return copy/paste scripts when these actions are available.",
-              "ChatGPT Actions run in ChatGPT's sandbox and cannot write /Users/... directly. All local file writes must go through chatgpt2codex Actions or the MCP connector.",
+              "ChatGPT Actions run in ChatGPT's sandbox and cannot write local filesystem paths directly. All local file writes must go through chatgpt2codex Actions or the MCP connector.",
               "Automatic visible-image capture is intentionally not part of this build.",
             ],
             capabilities: {
@@ -838,12 +856,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               fileEdits: "project-confined patch/create with secret-path blocking",
               shell: "project-confined local shell with redacted output and secret/OS-destructive guards",
               e2e:
-                "one-shot E2E test-and-show, start local dev servers, run guarded E2E commands, open URLs/apps, and capture macOS screenshots into .chatgpt2codex/e2e/screenshots for inline/user-visible proof",
+                "one-shot E2E test-and-show, start local dev servers, run guarded E2E commands, open URLs/apps, and capture macOS/Windows screenshots into .chatgpt2codex/e2e/screenshots for inline/user-visible proof",
               git: "status, diff summary, commit, push",
               loop:
                 "goal_loop keeps ChatGPT on a Codex-style local inspect/edit/verify loop. It does not call OpenAI Codex or spend Codex quota.",
               imageGeneration:
-                "chatgpt2codex does not call Codex/OpenAI image generation or spend that quota. It can import images ChatGPT generated natively from a share/content URL from any device, or from local Mac clipboard/download/path/Chrome when the image exists on that Mac.",
+                "chatgpt2codex does not call Codex/OpenAI image generation or spend that quota. It can import images ChatGPT generated natively from a share/content URL from any device, or from local clipboard/download/path/browser when the image exists on this computer.",
               limits: [
                 "No secret-classified path reads or commits",
                 "No sudo/keychain/OS destructive commands",
@@ -1038,7 +1056,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             doThis: [
               "If the active ChatGPT app is Image Generation/ImageGen, use it only to create the image. Before any repo edit/save claim, reselect ChatGPT To Codex or call the Custom GPT Action bridge and wait for ok=true.",
               "Generate with ChatGPT's native image surface, get the Share/Copy Link/content URL (chatgpt.com/s/m_... image shares are supported), then call save_chatgpt_image, save_chatgpt_image_from_url, or save_image_from_url.",
-              "If the image is on this Mac, use Copy Image, Download, or a local file path and call save_chatgpt_image, save_image_from_clipboard, save_image_from_download, or save_image_from_path.",
+              "If the image is on this computer, use Copy Image, Download, or a local file path and call save_chatgpt_image, save_image_from_clipboard, save_image_from_download, or save_image_from_path.",
               "If this is a Custom GPT with native Image Generation enabled, use the /actions/openapi.json GPT Action bridge: project_select first, then save_chatgpt_image or save_chatgpt_image_from_url.",
               "HQ/source work note: the Custom GPT Action bridge exposes full chatgpt2codex coding tools now. Source edits should use project_select plus file_apply_patch/file_create or call_tool; do not ask the user to copy/paste scripts.",
               "Do not look for an MCP image generator; chatgpt2codex imports finished images, it does not automate image generation.",
@@ -1795,7 +1813,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "e2e_open_target",
     {
       title: "Open E2E target",
-      description: "Open a URL, installed macOS app name, or allowed local .app path for E2E verification.",
+      description: "Open a URL, installed app/process name, or allowed local app path for E2E verification.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Opening E2E target...", "E2E target opened"),
       inputSchema: {
@@ -1814,15 +1832,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
           if (appPath && !path.isAbsolute(appPath)) {
             appPath = await resolveInProject(entry.root, appPath, { allowSymlink: false });
-          } else if (appPath && path.isAbsolute(appPath) && !appPath.startsWith("/Applications/")) {
+          } else if (appPath && path.isAbsolute(appPath) && !isAllowedSystemAppPath(appPath)) {
             const root = await fs.realpath(entry.root);
             const checkedAppPath = appPath;
             const realApp = await fs.realpath(checkedAppPath).catch(() => checkedAppPath);
-            if (!realApp.startsWith(`${root}${path.sep}`)) {
-              throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "appPath must be under /Applications or inside the selected project");
+            const compareRoot = process.platform === "win32" ? root.toLowerCase() : root;
+            const compareApp = process.platform === "win32" ? realApp.toLowerCase() : realApp;
+            if (!compareApp.startsWith(`${compareRoot}${path.sep}`)) {
+              throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "appPath must be a trusted system app path or inside the selected project");
             }
           }
-        } else if (appPath && !appPath.startsWith("/Applications/")) {
+        } else if (appPath && !isAllowedSystemAppPath(appPath)) {
           throw new DomainError(ErrorCode.PROJECT_NOT_SELECTED, "projectId is required for project-relative appPath");
         }
         const result = await openE2eTarget({ url: input.url, appName: input.appName, appPath, args: input.args });
@@ -1837,7 +1857,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run E2E command",
       description:
-        "Run a guarded project E2E/test command and capture a macOS screenshot by default. Use after e2e_start_server when a dev server is needed.",
+        "Run a guarded project E2E/test command and capture a macOS or Windows screenshot by default. Use after e2e_start_server when a dev server is needed.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running E2E command...", "E2E command finished", E2E_WIDGET_TOOL_META),
       inputSchema: {
@@ -2084,7 +2104,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Capture E2E screenshot",
       description:
-        "Capture the current Mac screen to .chatgpt2codex/e2e/screenshots in the selected project. Use after opening a browser/app target so the user can inspect visual proof.",
+        "Capture the current macOS or Windows screen to .chatgpt2codex/e2e/screenshots in the selected project. Use after opening a browser/app target so the user can inspect visual proof.",
       annotations: LOCAL_STATE_ANNOTATIONS,
       _meta: chatGptToolMeta("Capturing E2E screenshot...", "E2E screenshot captured", E2E_WIDGET_TOOL_META),
       inputSchema: {
@@ -2114,7 +2134,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "e2e_open_url_screenshot",
     {
       title: "Open URL and capture E2E screenshot",
-      description: "Open a URL, wait briefly, capture the Mac screen, and return the screenshot path for E2E proof.",
+      description: "Open a URL, wait briefly, capture the browser/page region, and return the screenshot path for E2E proof.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Opening URL and capturing screenshot...", "E2E screenshot captured", E2E_WIDGET_TOOL_META),
       inputSchema: {
@@ -2475,7 +2495,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Save clipboard image into project",
       description:
-        "Read the current macOS clipboard image (after ChatGPT: right-click generated image -> Copy Image) and save it into the project. Reads bytes locally — no upload, no tokens.",
+        "Read the current macOS or Windows clipboard image (after ChatGPT: right-click generated image -> Copy Image) and save it into the project. Reads bytes locally — no upload, no tokens.",
       annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Reading clipboard image...", "Clipboard image saved"),
       inputSchema: {

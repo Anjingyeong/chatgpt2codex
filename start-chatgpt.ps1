@@ -101,7 +101,7 @@ function Resolve-HostWithCloudflareDoh([string]$HostName) {
 
     try {
         $queryUrl = "https://cloudflare-dns.com/dns-query?name=$([System.Uri]::EscapeDataString($HostName))&type=A"
-        $jsonText = & curl.exe --silent --show-error --resolve "cloudflare-dns.com:443:1.1.1.1" -H "accept: application/dns-json" --max-time 20 $queryUrl
+        $jsonText = & curl.exe --silent --show-error --resolve "cloudflare-dns.com:443:1.1.1.1" -H "accept: application/dns-json" --max-time 8 $queryUrl
         if ($LASTEXITCODE -ne 0) { return @() }
         $json = ($jsonText -join "`n") | ConvertFrom-Json
         return @($json.Answer | Where-Object { $_.type -eq 1 -and $_.data } | ForEach-Object { [string]$_.data })
@@ -120,7 +120,7 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
         $ips = Resolve-HostWithCloudflareDoh $uri.Host
         foreach ($ip in $ips) {
             $resolve = "$($uri.Host):443:$ip"
-            $output = & curl.exe --silent --show-error --resolve $resolve --max-time 20 --write-out "`nHTTP_STATUS:%{http_code}" $Url
+            $output = & curl.exe --silent --show-error --resolve $resolve --connect-timeout 5 --max-time 10 --write-out "`nHTTP_STATUS:%{http_code}" $Url
             $text = ($output -join "`n")
             $statusMatch = [regex]::Match($text, "HTTP_STATUS:(\d+)")
             $status = if ($statusMatch.Success) { [int]$statusMatch.Groups[1].Value } else { 0 }
@@ -135,12 +135,18 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
 
 function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label) {
     for ($i = 0; $i -lt $Tries; $i++) {
+        $standardError = $null
         try {
             $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri $Url
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
                 return
             }
         } catch {
+            $standardError = $_.Exception.Message
+        }
+        if ($standardError -and ($i % 5 -eq 0) -and
+            (Test-HttpOkWithCurlResolve $Url)) {
+            return
         }
         Start-Sleep -Seconds 1
     }
@@ -201,6 +207,57 @@ function Stop-Child([System.Diagnostics.Process]$Process) {
     }
 }
 
+function Test-PathUnder([string]$Value, [string]$Parent) {
+    if (-not $Value -or -not $Parent) { return $false }
+    try {
+        $fullValue = [System.IO.Path]::GetFullPath($Value.Trim('"')).TrimEnd('\')
+        $fullParent = [System.IO.Path]::GetFullPath($Parent.Trim('"')).TrimEnd('\')
+        return $fullValue.Equals($fullParent, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $fullValue.StartsWith($fullParent + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Stop-StaleRuntimeProcesses([int]$PortToStop) {
+    $currentPid = $PID
+    $escapedRoot = [regex]::Escape($Root)
+    $stopped = @()
+
+    foreach ($proc in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) {
+        $procPid = [int]$proc.ProcessId
+        if ($procPid -eq $currentPid -or $procPid -le 0) { continue }
+
+        $cmd = [string]$proc.CommandLine
+        $exe = [string]$proc.ExecutablePath
+        if (-not $cmd -and -not $exe) { continue }
+
+        $isRuntimeProcess = (Test-PathUnder $exe $Root) -or ($cmd -match $escapedRoot)
+        if (-not $isRuntimeProcess) { continue }
+
+        $isSamePortServer = $cmd -match "dist[\\/]+cli\.js" -and
+            $cmd -match "\bserve\b" -and
+            $cmd -match "\b--port\s+$PortToStop\b"
+        $isSamePortTunnel = $cmd -match "\bcloudflared(\.exe)?\b" -and
+            ($cmd -match "127\.0\.0\.1:$PortToStop" -or $cmd -match "localhost:$PortToStop")
+        $isLauncherScript = $cmd -match "start-chatgpt\.ps1" -and
+            ($cmd -match "\b-Port\s+$PortToStop\b" -or $cmd -match $escapedRoot)
+
+        if ($isSamePortServer -or $isSamePortTunnel -or $isLauncherScript) {
+            try {
+                Stop-Process -Id $procPid -Force -ErrorAction SilentlyContinue
+                $stopped += "$($proc.Name)#$procPid"
+            } catch {
+            }
+        }
+    }
+
+    if ($stopped.Count -gt 0) {
+        Write-Host "[chatgpt2codex] stopped stale runtime process(es): $($stopped -join ', ')"
+        Start-Sleep -Milliseconds 800
+    }
+}
+
 Need-Command node
 Set-Location $Root
 
@@ -210,11 +267,29 @@ if (-not (Test-Path (Join-Path $Root "dist\cli.js"))) {
     npm run build
 }
 
+Stop-StaleRuntimeProcesses $Port
 if (Test-PortBusy $Port) {
     throw "Port $Port is already in use. Set PORT or stop the other process."
 }
 
 $cli = Join-Path $Root "dist\cli.js"
+if ($RotateOwnerToken -or $env:CHATGPT2CODEX_ROTATE_OWNER_TOKEN -eq "1") {
+    Write-Host "[chatgpt2codex] generating owner token..."
+    $tokenJsonText = node $cli owner-token --generate --workspace $Workspace
+    if ($LASTEXITCODE -ne 0) {
+        throw "Owner token generation failed."
+    }
+    $tokenResult = ($tokenJsonText -join "`n") | ConvertFrom-Json
+    if (-not $tokenResult.ownerToken) {
+        throw "Owner token generation did not return a token."
+    }
+    Write-Host ""
+    Write-Host "chatgpt2codex init: generated a new HTTP owner token (shown once, never logged again):"
+    Write-Host ""
+    Write-Host "  $($tokenResult.ownerToken)"
+    Write-Host ""
+    Write-Host "Store this securely. It is required to approve ChatGPT/MCP connections."
+}
 $doctor = node $cli doctor 2>$null
 if (($doctor -join "`n") -notmatch "owner token configured") {
     throw "Owner token is not configured. Open ChatGPT To Codex settings and generate or set an owner token first."
@@ -262,9 +337,19 @@ try {
     $srvProc = Start-LoggedProcess "node" $serverArgs $srvOut $srvErr
     Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
 
+    Write-Host ""
+    Write-Host "[chatgpt2codex] connector URL ready:"
+    Write-Host "   $publicUrl/mcp"
+    Write-Host ""
+
     if ($useTunnel) {
         Write-Host "[chatgpt2codex] 3/3 checking public health..."
-        Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint"
+        try {
+            Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint"
+        } catch {
+            Write-Host "[chatgpt2codex] public health check is still warming up: $($_.Exception.Message)"
+            Write-Host "[chatgpt2codex] keeping the server and tunnel alive; retry health from the app or ChatGPT."
+        }
     }
 
     Write-Host ""

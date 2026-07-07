@@ -181,6 +181,31 @@ port_busy() {
   ' "$PORT"
 }
 
+stop_stale_runtime_processes() {
+  local stopped=()
+  local patterns=(
+    "dist/cli.js serve --http --port $PORT"
+    "cloudflared.*127[.]0[.]0[.]1:$PORT"
+    "cloudflared.*localhost:$PORT"
+  )
+  local pattern pid command
+  for pattern in "${patterns[@]}"; do
+    while IFS= read -r pid; do
+      [[ -z "$pid" || "$pid" == "$$" || "$pid" == "${PPID:-}" ]] && continue
+      command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      [[ -z "$command" ]] && continue
+      if [[ "$command" == *"$ROOT"* || "$command" == *"cloudflared"* ]]; then
+        kill "$pid" 2>/dev/null || true
+        stopped+=("$pid")
+      fi
+    done < <(pgrep -f "$pattern" 2>/dev/null || true)
+  done
+  if [[ "${#stopped[@]}" -gt 0 ]]; then
+    echo "[chatgpt2codex] stopped stale runtime process(es): ${stopped[*]}"
+    sleep 1
+  fi
+}
+
 run_macos_doctor
 
 need_cmd node
@@ -197,6 +222,7 @@ if [[ ! -f "$ROOT/dist/cli.js" ]]; then
   npm run build
 fi
 
+stop_stale_runtime_processes
 if port_busy; then
   echo "[chatgpt2codex] port $PORT is already in use. Set PORT=xxxx or stop the other process." >&2
   exit 1

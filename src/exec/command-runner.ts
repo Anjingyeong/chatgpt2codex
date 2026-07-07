@@ -202,7 +202,9 @@ function killProcessTree(pid: number | undefined, done: () => void): void {
     return;
   }
   if (process.platform === "win32") {
-    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => done());
+    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => {
+      setTimeout(done, 250);
+    });
     return;
   }
   try {

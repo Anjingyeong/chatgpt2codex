@@ -17,7 +17,7 @@ describe("prepareChatGptImagesApp", () => {
 
     const result = await prepareChatGptImagesApp(
       { prompt: "make a clean SaaS banner", browser: "chrome" },
-      { execFileImpl, sleepMs: async () => undefined },
+      { execFileImpl, sleepMs: async () => undefined, platform: "darwin" },
     );
 
     expect(result).toMatchObject({
@@ -32,6 +32,18 @@ describe("prepareChatGptImagesApp", () => {
       args: ["-a", "Google Chrome", CHATGPT_IMAGES_APP_URL],
     });
     expect(calls).toHaveLength(1);
+  });
+
+  it("opens ChatGPT Images through cmd on Windows", async () => {
+    const { calls, execFileImpl } = captureExecCalls();
+
+    await prepareChatGptImagesApp(
+      { browser: "default" },
+      { execFileImpl, sleepMs: async () => undefined, platform: "win32" },
+    );
+
+    expect(calls[0]?.file.toLowerCase()).toContain("cmd");
+    expect(calls[0]?.args).toEqual(["/d", "/s", "/c", `start "" "${CHATGPT_IMAGES_APP_URL}"`]);
   });
 
   it("requires explicit confirmation before submitting to ChatGPT", async () => {

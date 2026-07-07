@@ -581,7 +581,8 @@ internal sealed class LauncherForm : Form
     {
         if (!string.IsNullOrEmpty(mcpUrl)) return mcpUrl;
         if (publicTunnelEnabled && !string.IsNullOrEmpty(configuredPublicHost)) return "https://" + configuredPublicHost + "/mcp";
-        return null;
+        if (publicTunnelEnabled) return null;
+        return "http://127.0.0.1:" + port + "/mcp";
     }
 
     private static bool IsTemporaryTunnelUrl(string url)
@@ -931,6 +932,14 @@ internal sealed class LauncherForm : Form
         restartTrayItem.Enabled = true;
         restartTrayItem.Text = L("restartMCP");
         var connector = ConnectorUrl();
+        if (!string.IsNullOrEmpty(connector) && (string.IsNullOrEmpty(urlBox.Text) || urlBox.Text == "Connector URL will appear here"))
+        {
+            urlBox.Text = connector;
+        }
+        else if (string.IsNullOrEmpty(connector) && publicTunnelEnabled && running)
+        {
+            urlBox.Text = "Waiting for Cloudflare connector URL...";
+        }
         copyButton.Enabled = !string.IsNullOrEmpty(connector);
         copyButton.Text = L("copyConnector");
         copyOwnerTokenButton.Text = L("copyOwnerToken");
@@ -1228,6 +1237,12 @@ internal sealed class LauncherForm : Form
     private void StartLauncher()
     {
         stopping = false;
+        if (publicTunnelEnabled && string.IsNullOrWhiteSpace(configuredPublicHost))
+        {
+            mcpUrl = null;
+            urlBox.Text = "Waiting for Cloudflare connector URL...";
+            copyButton.Enabled = false;
+        }
         var script = Path.Combine(root, "start-chatgpt.ps1");
         if (!File.Exists(script))
         {
@@ -1254,8 +1269,12 @@ internal sealed class LauncherForm : Form
         }
 
         var powerShellArgs = "-NoProfile -ExecutionPolicy Bypass -File " + Quote(script);
-        var launcherArgs = BuildLauncherArgs();
-        if (launcherArgs.Length > 0) powerShellArgs += " " + JoinArgs(launcherArgs);
+        var launcherArgs = new List<string>(BuildLauncherArgs());
+        if (autoGenerateOwnerTokenOnNextStart)
+        {
+            launcherArgs.Add("-RotateOwnerToken");
+        }
+        if (launcherArgs.Count > 0) powerShellArgs += " " + JoinArgs(launcherArgs.ToArray());
 
         process = new Process();
         process.StartInfo = new ProcessStartInfo

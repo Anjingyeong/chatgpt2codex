@@ -358,7 +358,9 @@ async function cmdDoctor(): Promise<void> {
   );
   console.log(`http default endpoint: http://127.0.0.1:7979/mcp (start via \`chatgpt2codex serve --http\`)`);
   console.log(
-    `image intake: pngpaste ${intake.pngpasteAvailable ? "found" : "not found — clipboard image intake unavailable"}, ` +
+    `image intake: clipboard ${intake.clipboardImageAvailable ? "available" : "unavailable"}, ` +
+      `pngpaste ${intake.pngpasteAvailable ? "found" : "not found"}, ` +
+      `Windows clipboard ${intake.windowsClipboardAvailable ? "available" : "unavailable"}, ` +
       `~/Downloads ${intake.downloadsDirExists ? "found" : "NOT FOUND — download intake unavailable"}`,
   );
   console.log(

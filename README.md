@@ -6,7 +6,7 @@
 
 **Give ChatGPT real local coding hands.**
 
-ChatGPT To Codex is a macOS-first local MCP and Actions runtime that lets ChatGPT
+ChatGPT To Codex is a local MCP and Actions runtime for macOS and Windows that lets ChatGPT
 work inside the project folder you choose: read files, search code, apply
 patches, run tests, launch E2E checks, and send back screenshot proof.
 
@@ -29,7 +29,7 @@ ChatGPT To Codex fills that gap:
 - local project selection instead of uploading a source tree
 - guarded file reads and hash-checked patching
 - allowlisted local commands for tests and checks
-- macOS app/window/browser screenshot capture for visual E2E proof
+- macOS/Windows app, window, and browser screenshot capture for visual E2E proof
 - temporary or fixed HTTPS connector URL for ChatGPT web
 - OAuth-style owner-token approval so random clients cannot just attach
 - multilingual menu bar app for non-English users
@@ -37,7 +37,7 @@ ChatGPT To Codex fills that gap:
 The mental model is simple:
 
 ```text
-ChatGPT thinks. Your Mac acts. You review the result.
+ChatGPT thinks. Your computer acts. You review the result.
 ```
 
 ## Current Release
@@ -45,7 +45,7 @@ ChatGPT thinks. Your Mac acts. You review the result.
 | Platform | Status | Package |
 | --- | --- | --- |
 | macOS | Public test release | `installers/macos/chatgpt2codex-0.1.1.pkg` |
-| Windows | In testing, not polished enough for public install yet | Not published |
+| Windows | Source/package build available, public installer not published yet | Build locally with `npm run windows:package` |
 | Linux | Developer path only | Not published |
 
 ### Why PKG Instead Of DMG?
@@ -74,7 +74,7 @@ project:
 - run project commands and tests
 - start a dev server and wait for a URL
 - open a browser URL or installed desktop app
-- capture macOS E2E screenshots
+- capture macOS/Windows E2E screenshots
 - return inline screenshot previews through Actions
 - save generated image assets into the repo
 - summarize diffs, blockers, and verification evidence
@@ -131,7 +131,7 @@ passing screenshot set inline before you say it is done.
 ChatGPT To Codex is designed for trusted local development, not arbitrary public
 automation.
 
-- It runs locally on your Mac.
+- It runs locally on your computer.
 - It defaults to loopback-only networking.
 - ChatGPT web requires an explicit connector/tunnel mode.
 - File operations are scoped to the selected project.
@@ -155,9 +155,10 @@ Chinese. More documentation languages are welcome.
 
 ## Windows Status
 
-Windows support exists in the source tree, but the public installer is not ready
-for beginners yet. It is still being tested for install reliability, tray UX,
-dependency setup, and E2E behavior. The public release focus is macOS first.
+Windows support now includes the tray launcher, local installer/package build,
+owner-token setup flow, ChatGPT web connector settings, and Windows E2E
+screenshot proof. A public beginner installer has not been published yet; build
+it locally with `npm run windows:package`.
 
 ## Repository Contents
 

@@ -187,6 +187,8 @@ private final class ServiceController {
     private let startMCPOnLaunchKey = "startMCPOnLaunch"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
     private(set) var process: Process?
+    private var currentQuickTunnelBaseURL: URL?
+    private var quickTunnelLogBuffer = ""
 
     let appName = "ChatGPT To Codex"
     let defaultWorkspace: String
@@ -496,7 +498,7 @@ private final class ServiceController {
         if let publicHost {
             return URL(string: "https://\(publicHost)")
         }
-        return discoverQuickTunnelBaseURL()
+        return currentQuickTunnelBaseURL
     }
 
     var connectorURL: URL? {
@@ -548,6 +550,8 @@ private final class ServiceController {
             process.terminate()
         }
         process = nil
+        currentQuickTunnelBaseURL = nil
+        quickTunnelLogBuffer = ""
 
         let startPattern = shellQuote("start-chatgpt.sh")
         let servePattern = shellQuote("dist/cli.js serve --http --port \(port)")
@@ -573,6 +577,10 @@ private final class ServiceController {
             throw NSError(domain: "ChatGPTToCodex", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "start-chatgpt.sh not found at \(script.path)"
             ])
+        }
+        if enablePublicTunnel && publicHost == nil {
+            currentQuickTunnelBaseURL = nil
+            quickTunnelLogBuffer = ""
         }
 
         let command = """
@@ -613,6 +621,10 @@ private final class ServiceController {
             DispatchQueue.main.async {
                 if self?.process === process {
                     self?.process = nil
+                    if self?.publicHost == nil {
+                        self?.currentQuickTunnelBaseURL = nil
+                        self?.quickTunnelLogBuffer = ""
+                    }
                 }
             }
         }
@@ -633,25 +645,31 @@ private final class ServiceController {
     }
 
     private func appendLogMirror(_ text: String) {
+        captureQuickTunnelBaseURL(from: text)
         if text.contains("chatgpt2codex is ready") || text.contains("exited") || text.contains("missing command") {
             NSLog("%@", text)
         }
     }
 
-    private func discoverQuickTunnelBaseURL() -> URL? {
-        guard let data = try? Data(contentsOf: logFile),
-              let text = String(data: data, encoding: .utf8),
-              let regex = try? NSRegularExpression(pattern: #"https://[A-Za-z0-9.-]+\.trycloudflare\.com"#)
-        else {
-            return nil
+    private func captureQuickTunnelBaseURL(from text: String) {
+        guard enablePublicTunnel, publicHost == nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.quickTunnelLogBuffer += text
+            if self.quickTunnelLogBuffer.count > 65536 {
+                self.quickTunnelLogBuffer = String(self.quickTunnelLogBuffer.suffix(65536))
+            }
+            guard let regex = try? NSRegularExpression(pattern: #"https://[A-Za-z0-9.-]+\.trycloudflare\.com"#) else {
+                return
+            }
+            let range = NSRange(self.quickTunnelLogBuffer.startIndex..<self.quickTunnelLogBuffer.endIndex, in: self.quickTunnelLogBuffer)
+            guard let match = regex.matches(in: self.quickTunnelLogBuffer, range: range).last,
+                  let matchRange = Range(match.range, in: self.quickTunnelLogBuffer)
+            else {
+                return
+            }
+            self.currentQuickTunnelBaseURL = URL(string: String(self.quickTunnelLogBuffer[matchRange]))
         }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.matches(in: text, range: range).last,
-              let matchRange = Range(match.range, in: text)
-        else {
-            return nil
-        }
-        return URL(string: String(text[matchRange]))
     }
 
     func checkForUpdates(completion: @escaping (String, URL?) -> Void) {

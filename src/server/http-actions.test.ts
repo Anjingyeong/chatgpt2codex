@@ -232,7 +232,7 @@ describe("Custom GPT action bridge", () => {
     expect(body.openapi).toBe("3.1.0");
     expect(body.info.version).toBe("0.1.6");
     expect(body.info.description).toContain("source editing");
-    expect(body.info.description).toContain("cannot write /Users/");
+    expect(body.info.description).toContain("cannot write local filesystem paths directly");
     expect(body.info.description).toContain("30 operations");
     expect(body.info.description).toContain("workspace_list_projects");
     expect(body.info.description).toContain("save_chatgpt_image/save_chatgpt_image_from_url");
