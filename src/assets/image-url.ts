@@ -1,5 +1,9 @@
 import { isIP } from "node:net";
+import type { LookupFunction } from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { Readable } from "node:stream";
 import { DomainError, ErrorCode } from "../types.js";
 import { detect, type SavedImage } from "./images.js";
 
@@ -28,9 +32,26 @@ export interface FetchImageResult {
   mime: SavedImage["mime"];
 }
 
+/** An address validated (range-checked) by `assertHostAllowed`/`assertUrlAllowed`
+ * at time-of-check. Passed through to `fetchImpl` as `pinnedAddresses` so the
+ * connection at time-of-use is forced onto one of these exact addresses
+ * instead of re-resolving the hostname (which would reopen the DNS-rebinding
+ * TOCTOU window: a validated public IP could otherwise be swapped for a
+ * private/metadata one by the time the connection is actually made). */
+export interface PinnedAddress {
+  address: string;
+  family: number;
+}
+
 /** Injectable subset of the global `fetch` signature this module needs,
- * so tests can supply a mock implementation without a network. */
-export type FetchLike = (url: string, init?: { signal?: AbortSignal; redirect?: "manual" }) => Promise<{
+ * so tests can supply a mock implementation without a network. `pinnedAddresses`
+ * carries the exact addresses validated for this hostname/hop — a real
+ * `fetchImpl` MUST connect only to one of these (see `defaultFetchImpl`),
+ * never re-resolve the hostname itself. */
+export type FetchLike = (
+  url: string,
+  init?: { signal?: AbortSignal; redirect?: "manual"; pinnedAddresses?: PinnedAddress[] },
+) => Promise<{
   status: number;
   headers: { get(name: string): string | null };
   body: ReadableStream<Uint8Array> | null;
@@ -70,8 +91,10 @@ const BLOCKED_IPV4_CIDRS = [
   "192.168.0.0/16", // private
   "169.254.0.0/16", // link-local / cloud metadata (169.254.169.254)
   "0.0.0.0/8", // "this network" / unspecified-ish
+  "100.64.0.0/10", // RFC 6598 CGNAT/shared address space (e.g. Alibaba Cloud metadata 100.100.100.200)
   "192.0.0.0/24", // IETF protocol assignments
   "192.0.2.0/24", // TEST-NET-1
+  "192.88.99.0/24", // 6to4 anycast relay (RFC 3068)
   "198.18.0.0/15", // benchmarking
   "198.51.100.0/24", // TEST-NET-2
   "203.0.113.0/24", // TEST-NET-3
@@ -80,8 +103,12 @@ const BLOCKED_IPV4_CIDRS = [
 ];
 
 /** Whether an IPv6 address falls in a blocked range: loopback (::1),
- * unspecified (::), link-local (fe80::/10), unique-local/ULA (fc00::/7), or
- * an IPv4-mapped address (::ffff:a.b.c.d) whose embedded IPv4 is blocked. */
+ * unspecified (::), link-local (fe80::/10), unique-local/ULA (fc00::/7), an
+ * IPv4-mapped address (::ffff:a.b.c.d or its hex-group equivalent, e.g.
+ * ::ffff:7f00:1) whose embedded IPv4 is blocked, or an IPv6
+ * transition/tunneling range that can carry traffic to/through an internal
+ * IPv4 address: NAT64 (64:ff9b::/96), 6to4 (2002::/16), or Teredo
+ * (2001::/32). */
 function isBlockedIpv6(ip: string): boolean {
   const normalized = ip.toLowerCase();
   if (normalized === "::1" || normalized === "::") return true;
@@ -89,10 +116,34 @@ function isBlockedIpv6(ip: string): boolean {
   const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (mapped) return isBlockedIpv4OrUnspecified(mapped[1] ?? "");
 
+  // ::ffff:0:0/96 (hex-group form of the IPv4-mapped range above): the same
+  // embedded IPv4 written as two hex groups instead of a dotted quad, e.g.
+  // ::ffff:7f00:1 === ::ffff:127.0.0.1 and ::ffff:a9fe:a9fe ===
+  // ::ffff:169.254.169.254. Defense in depth — decode the hex groups back
+  // to a dotted IPv4 and check it exactly like the dotted form.
+  const mappedHex = normalized.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const hi = Number.parseInt(mappedHex[1] ?? "0", 16);
+    const lo = Number.parseInt(mappedHex[2] ?? "0", 16);
+    const embeddedIpv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return isBlockedIpv4OrUnspecified(embeddedIpv4);
+  }
+
   // fe80::/10 link-local: first 10 bits are 1111111010.
   if (/^fe[89ab][0-9a-f]:/.test(normalized)) return true;
   // fc00::/7 unique local: first 7 bits are 1111110.
   if (/^f[cd][0-9a-f]{2}:/.test(normalized)) return true;
+  // 64:ff9b::/96 NAT64 well-known prefix: groups 1-2 ("64", "ff9b") are
+  // non-zero so they're never elided by "::" compression, making a literal
+  // prefix match safe regardless of how the trailing embedded IPv4 groups
+  // are written.
+  if (/^64:ff9b:/.test(normalized)) return true;
+  // 2002::/16 6to4: group 1 ("2002") is non-zero and thus always literal.
+  if (/^2002:/.test(normalized)) return true;
+  // 2001::/32 Teredo: group 1 ("2001") is always literal; group 2 must be
+  // zero for the address to be in this /32, whether written out ("2001:0:"
+  // / "2001:0000:") or elided via "::" ("2001::").
+  if (/^2001:0*(:|$)/.test(normalized)) return true;
 
   return false;
 }
@@ -125,18 +176,24 @@ const defaultLookup: LookupFn = (hostname) => dnsLookup(hostname, { all: true, v
  * any blocked address (DNS rebinding / multi-A-record defense: ALL resolved
  * addresses are checked, not just the first).
  *
+ * Returns the exact validated addresses so the caller can pin the actual
+ * connection to them — resolving again at connect time (as a bare
+ * `fetch(hostname)` would) reopens the DNS-rebinding TOCTOU window this
+ * function exists to close.
+ *
  * @throws {DomainError} PERMISSION_DENIED if the host is/resolves to a
  *   blocked address, or resolution fails outright.
  */
-async function assertHostAllowed(hostname: string, lookupImpl: LookupFn): Promise<void> {
+async function assertHostAllowed(hostname: string, lookupImpl: LookupFn): Promise<PinnedAddress[]> {
   // Literal IP host (e.g. http://169.254.169.254/) — check directly, no DNS.
   if (isIP(hostname)) {
+    const family = isIP(hostname);
     if (isBlockedAddress(hostname)) {
       throw new DomainError(ErrorCode.PERMISSION_DENIED, `URL host resolves to a blocked address: ${hostname}`, {
         hostname,
       });
     }
-    return;
+    return [{ address: hostname, family }];
   }
 
   let addresses: Array<{ address: string; family: number }>;
@@ -160,17 +217,21 @@ async function assertHostAllowed(hostname: string, lookupImpl: LookupFn): Promis
       );
     }
   }
+  return addresses;
 }
 
 /**
  * Validate a candidate URL's scheme and (via DNS) its resolved address(es)
  * before it is ever used to open a connection.
  *
+ * Returns the parsed URL together with the exact validated addresses, so the
+ * connection can be pinned to them (see `PinnedAddress`).
+ *
  * @throws {DomainError} PERMISSION_DENIED if the scheme is not http/https or
  *   the host is/resolves to a blocked address; INVALID_IMAGE_DATA if the
  *   string isn't a parseable URL.
  */
-async function assertUrlAllowed(rawUrl: string, lookupImpl: LookupFn): Promise<URL> {
+async function assertUrlAllowed(rawUrl: string, lookupImpl: LookupFn): Promise<{ url: URL; addresses: PinnedAddress[] }> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -183,9 +244,99 @@ async function assertUrlAllowed(rawUrl: string, lookupImpl: LookupFn): Promise<U
       scheme: parsed.protocol,
     });
   }
-  await assertHostAllowed(parsed.hostname, lookupImpl);
-  return parsed;
+  const addresses = await assertHostAllowed(parsed.hostname, lookupImpl);
+  return { url: parsed, addresses };
 }
+
+// ---------------------------------------------------------------------------
+// Pinned connection (DNS-rebinding defense)
+// ---------------------------------------------------------------------------
+//
+// `assertUrlAllowed`/`assertHostAllowed` above validate a hostname's resolved
+// addresses at time-of-check (T0). If the actual connection is later made by
+// handing the *hostname* to something that does its own DNS resolution (e.g.
+// global `fetch`), that resolution happens at time-of-use (T1) and can return
+// a different, attacker-controlled address (DNS rebinding: authoritative DNS
+// under attacker control, short/zero TTL). The fix is to never let the
+// connection re-resolve the hostname: `defaultFetchImpl` below uses node:http
+// /node:https with a `lookup` override that can only ever return the exact
+// addresses `assertUrlAllowed` already validated, so T1 is constrained to a
+// subset of T0. The URL (and therefore the Host header / TLS SNI) is never
+// rewritten to a bare IP, so virtual-hosted CDNs and certificate validation
+// keep working unchanged.
+
+/** Build a `net.LookupFunction` that can only ever resolve to `addresses` —
+ * the exact set validated by `assertHostAllowed` — regardless of what real
+ * DNS would return for the hostname at connect time. This is what pins the
+ * connection to the validated address(es) and closes the TOCTOU window. */
+function pinnedLookup(addresses: PinnedAddress[]): LookupFunction {
+  return (_hostname, options, callback) => {
+    const first = addresses[0];
+    if (!first) {
+      callback(new Error("no pinned addresses available"), "");
+      return;
+    }
+    if (typeof options === "object" && options !== null && options.all) {
+      callback(
+        null,
+        addresses.map((a) => ({ address: a.address, family: a.family })),
+      );
+      return;
+    }
+    callback(null, first.address, first.family);
+  };
+}
+
+/** Default `FetchLike` implementation. Deliberately built on node:http/https
+ * (rather than global `fetch`/undici) so the `lookup` option can pin the TCP
+ * connection to the caller-validated `pinnedAddresses` — global `fetch` has
+ * no supported way to prevent it from re-resolving the hostname itself. */
+// Exported (in addition to being the internal default) so tests can drive
+// it directly against a local server and confirm the pinned `lookup` option
+// actually constrains the connection while leaving the Host header/TLS SNI
+// untouched — see image-url.test.ts's "Host/SNI preserved" test.
+export const defaultFetchImpl: FetchLike = (url, init) => {
+  const pinnedAddresses = init?.pinnedAddresses;
+  if (!pinnedAddresses || pinnedAddresses.length === 0) {
+    // Internal invariant: every call site in this module validates the URL
+    // via assertUrlAllowed (which yields addresses) before fetching, so this
+    // only fires on a programming error, never on attacker input.
+    return Promise.reject(new Error("defaultFetchImpl requires pinnedAddresses"));
+  }
+  const parsed = new URL(url);
+  const requestFn = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    const req = requestFn(
+      parsed,
+      {
+        method: "GET",
+        lookup: pinnedLookup(pinnedAddresses),
+        signal: init?.signal,
+      },
+      (res) => {
+        const headerMap = new Map<string, string>();
+        for (const [key, value] of Object.entries(res.headers)) {
+          if (value === undefined) continue;
+          headerMap.set(key.toLowerCase(), Array.isArray(value) ? value.join(", ") : value);
+        }
+        const body = Readable.toWeb(res) as ReadableStream<Uint8Array>;
+        resolve({
+          status: res.statusCode ?? 0,
+          headers: { get: (name: string) => headerMap.get(name.toLowerCase()) ?? null },
+          body,
+          arrayBuffer: async () => {
+            const chunks: Buffer[] = [];
+            for await (const chunk of res) chunks.push(chunk as Buffer);
+            const buf = Buffer.concat(chunks);
+            return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+          },
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+};
 
 // ---------------------------------------------------------------------------
 // Fetch + validate
@@ -337,18 +488,20 @@ function resolveChatGptShareImageUrls(currentUrl: URL, contentType: string | nul
  *   downloaded bytes are not a recognized image format.
  */
 export async function fetchImageFromUrl(url: string, opts: FetchImageOptions = {}): Promise<FetchImageResult> {
-  const fetchImpl: FetchLike = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
+  const fetchImpl: FetchLike = opts.fetchImpl ?? defaultFetchImpl;
   const lookupImpl: LookupFn = opts.lookupImpl ?? defaultLookup;
   const maxBytes = opts.maxBytes ?? MAX_IMAGE_BYTES;
   const timeoutMs = opts.timeoutMs ?? FETCH_TIMEOUT_MS;
   const maxRedirects = opts.maxRedirects ?? MAX_REDIRECTS;
 
-  let currentUrl = await assertUrlAllowed(url, lookupImpl);
+  let { url: currentUrl, addresses: pinnedAddresses } = await assertUrlAllowed(url, lookupImpl);
   let shareCandidateUrls: string[] = [];
   const tryNextShareCandidate = async (): Promise<boolean> => {
     const nextUrl = shareCandidateUrls.shift();
     if (!nextUrl) return false;
-    currentUrl = await assertUrlAllowed(nextUrl, lookupImpl);
+    const validated = await assertUrlAllowed(nextUrl, lookupImpl);
+    currentUrl = validated.url;
+    pinnedAddresses = validated.addresses;
     return true;
   };
 
@@ -359,7 +512,11 @@ export async function fetchImageFromUrl(url: string, opts: FetchImageOptions = {
     for (let hop = 0; ; hop++) {
       let res;
       try {
-        res = await fetchImpl(currentUrl.toString(), { signal: controller.signal, redirect: "manual" });
+        res = await fetchImpl(currentUrl.toString(), {
+          signal: controller.signal,
+          redirect: "manual",
+          pinnedAddresses,
+        });
       } catch (err) {
         if (controller.signal.aborted) {
           throw new DomainError(ErrorCode.TIMEOUT, `Fetching image timed out after ${timeoutMs}ms`, { url: currentUrl.toString() });
@@ -387,8 +544,11 @@ export async function fetchImageFromUrl(url: string, opts: FetchImageOptions = {
         const nextUrl = new URL(location, currentUrl);
         // Re-validate scheme + resolved IP of the redirect target exactly
         // like the original URL — this is what blocks "redirect to
-        // internal" SSRF bypasses.
-        currentUrl = await assertUrlAllowed(nextUrl.toString(), lookupImpl);
+        // internal" SSRF bypasses. The returned addresses re-pin the next
+        // hop's connection too.
+        const validatedRedirect = await assertUrlAllowed(nextUrl.toString(), lookupImpl);
+        currentUrl = validatedRedirect.url;
+        pinnedAddresses = validatedRedirect.addresses;
         continue;
       }
 
@@ -428,7 +588,9 @@ export async function fetchImageFromUrl(url: string, opts: FetchImageOptions = {
           const firstResolvedUrl = resolvedImageUrls[0];
           if (!firstResolvedUrl) continue;
           shareCandidateUrls = resolvedImageUrls.slice(1);
-          currentUrl = await assertUrlAllowed(firstResolvedUrl, lookupImpl);
+          const validatedCandidate = await assertUrlAllowed(firstResolvedUrl, lookupImpl);
+          currentUrl = validatedCandidate.url;
+          pinnedAddresses = validatedCandidate.addresses;
           continue;
         }
         if (await tryNextShareCandidate()) continue;

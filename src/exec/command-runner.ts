@@ -57,8 +57,13 @@ const NETWORK_NAME_PATTERN = /(install|deps|dependencies|fetch|pull)/i;
 
 const SECRET_SCRIPT_PATTERN =
   /(^|[\s/"'])\.(env|ssh|npmrc)([\s/"'.]|$)|id_rsa|id_ed25519|private[_-]?key|security\s+find-(generic|internet)-password|keychain/i;
-const DESTRUCTIVE_SCRIPT_PATTERN = /\bsudo\b|\brm\s+-[^;\n]*r[^;\n]*f[^;\n]*\/|\bdiskutil\s+erase|\bmkfs\b|\bshutdown\b|\breboot\b/i;
-const NETWORK_SCRIPT_PATTERN = /\b(npm|pnpm|yarn|bun)\s+(install|add|update)|\b(curl|wget)\b|\bgit\s+(pull|fetch|clone)\b/i;
+// `rm -rf`/`rm -fr` in either flag order, with or without a trailing slash
+// on the target (the previous pattern required a literal `/` after the
+// flags, so `rm -rf *`/`rm -rf .`/`rm -rf $DIR` all slipped past it into a
+// non-destructive riskTier). Also cover `find -delete` and `git clean`.
+const DESTRUCTIVE_SCRIPT_PATTERN =
+  /\bsudo\b|\brm\s+-\w*r\w*f\w*\b|\brm\s+-\w*f\w*r\w*\b|\bfind\b[^\n]*-delete\b|\bgit\s+clean\b|\bdiskutil\s+erase|\bmkfs\b|\bshutdown\b|\breboot\b/i;
+const NETWORK_SCRIPT_PATTERN = /\b(npm|pnpm|yarn|bun)\s+(install|add|update)|\b(curl|wget)\b|\bgit\s+(pull|fetch|clone|push)\b/i;
 
 function classifyByName(name: string): string {
   if (DESTRUCTIVE_NAME_PATTERN.test(name)) return "destructive";
@@ -106,6 +111,7 @@ async function discoverMakefileCommands(root: string): Promise<DiscoveredCommand
   if (!existsSync(makePath)) return [];
   try {
     const raw = await readFile(makePath, "utf8");
+    const lines = raw.split("\n");
     const targets: DiscoveredCommand[] = [];
     const seen = new Set<string>();
     // Match top-level Makefile targets: `name:` (not indented, not a variable
@@ -116,11 +122,31 @@ async function discoverMakefileCommands(root: string): Promise<DiscoveredCommand
       const name = match[1];
       if (!name || name.startsWith(".") || seen.has(name)) continue;
       seen.add(name);
+      // Package.json script discovery classifies by scanning the script
+      // *body* (classifyManifestCommand), not just the script name, so a
+      // secret/destructive/network recipe hiding under an innocuous script
+      // name (e.g. "check") still gets a `destructive`/`network` riskTier.
+      // Makefile targets previously only classified by target name
+      // (classifyByName), so a target named `verify`/`test`/`check` whose
+      // recipe ran `curl ... | sh` or `rm -rf /...` was tiered "verify" and
+      // ran with no APPROVAL_REQUIRED gate. Collect the recipe body (the
+      // tab-indented lines following the target line, skipping blank
+      // lines, stopping at the first non-indented/non-blank line) and
+      // classify on it exactly like package.json scripts do.
+      const startLine = raw.slice(0, match.index).split("\n").length - 1;
+      const recipeLines: string[] = [];
+      for (let i = startLine + 1; i < lines.length; i++) {
+        const line = lines[i] ?? "";
+        if (line.trim().length === 0) continue;
+        if (!line.startsWith("\t")) break;
+        recipeLines.push(line.slice(1));
+      }
+      const recipeBody = recipeLines.join("\n");
       targets.push({
         commandId: `make:${name}`,
         display: `make ${name}`,
         source: "Makefile",
-        riskTier: classifyByName(name),
+        riskTier: classifyManifestCommand(name, recipeBody),
         argv: ["make", name],
       });
     }
@@ -202,9 +228,7 @@ function killProcessTree(pid: number | undefined, done: () => void): void {
     return;
   }
   if (process.platform === "win32") {
-    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => {
-      setTimeout(done, 250);
-    });
+    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => done());
     return;
   }
   try {

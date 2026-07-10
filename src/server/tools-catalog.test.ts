@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "./mcp-server.js";
 import type { ToolContext } from "../types.js";
+
+const CONTROL_TOOL_NAMES = ["computer_screenshot", "computer_request_action", "computer_action_status", "computer_kill_switch"];
 
 function makeCtx(): ToolContext {
   const stateDir = "/tmp/chatgpt2codex-tools-catalog-test";
@@ -152,5 +154,110 @@ describe("tool catalog", () => {
     )._requestHandlers?.get("tools/list");
     const listed = await handler?.({ method: "tools/list", params: {} });
     expect(listed?.tools.map((tool) => tool.name)).not.toContain("code_context_pack");
+  });
+
+  it("agent_guide exposes Codex-grade loop, tool surface, and safety model", async () => {
+    const server = await createServer(makeCtx());
+    const tools = (
+      server as unknown as {
+        _registeredTools?: Record<string, { handler?: (input: unknown) => Promise<unknown> }>;
+      }
+    )._registeredTools;
+
+    const result = (await tools?.agent_guide?.handler?.({})) as {
+      structuredContent?: {
+        codexGradeLoop?: string[];
+        toolSurfaceMap?: Record<string, string[]>;
+        securityModel?: string[];
+        desktopControlModel?: string[];
+      };
+    };
+
+    expect(result.structuredContent?.codexGradeLoop?.join(" ")).toContain("Discover");
+    expect(result.structuredContent?.codexGradeLoop?.join(" ")).toContain("Verify");
+    expect(result.structuredContent?.toolSurfaceMap?.modify).toEqual(
+      expect.arrayContaining(["file_apply_patch", "file_create", "local_shell_run"]),
+    );
+    expect(result.structuredContent?.toolSurfaceMap?.verify).toEqual(
+      expect.arrayContaining(["e2e_test_and_show_screenshot", "e2e_run_command"]),
+    );
+    expect(result.structuredContent?.securityModel?.join(" ")).toContain("current-turn ChatGPT_To_Codex tool proof");
+    expect(result.structuredContent?.securityModel?.join(" ")).toContain("Prompt-injection posture");
+    expect(result.structuredContent?.desktopControlModel?.join(" ")).toContain("kill switch");
+    expect(result.structuredContent?.desktopControlModel?.join(" ")).toContain("sensitive apps");
+  });
+
+  describe("ChatGPT confirm-model exposure (CHATGPT2CODEX_CONTROL_CHATGPT)", () => {
+    afterEach(() => {
+      delete process.env.CHATGPT2CODEX_CONTROL_CHATGPT;
+    });
+
+    async function toolsListNames(): Promise<string[]> {
+      const server = await createServer(makeCtx());
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers?: Map<
+            string,
+            (request: { method: string; params: Record<string, never> }) => Promise<{
+              tools: Array<{ name: string; annotations?: Record<string, unknown>; _meta?: Record<string, unknown> }>;
+            }>
+          >;
+        }
+      )._requestHandlers?.get("tools/list");
+      const listed = await handler?.({ method: "tools/list", params: {} });
+      return listed?.tools.map((t) => t.name) ?? [];
+    }
+
+    it("hides the 4 control tools from tools/list by default (flag unset)", async () => {
+      const names = await toolsListNames();
+      for (const name of CONTROL_TOOL_NAMES) {
+        expect(names, name).not.toContain(name);
+      }
+    });
+
+    it.each(["0", "false", "off"])("hides the 4 control tools from tools/list when explicitly opted out (%s)", async (value) => {
+      process.env.CHATGPT2CODEX_CONTROL_CHATGPT = value;
+      const names = await toolsListNames();
+      for (const name of CONTROL_TOOL_NAMES) {
+        expect(names, name).not.toContain(name);
+      }
+    });
+
+    it("exposes all 4 control tools in tools/list once CHATGPT2CODEX_CONTROL_CHATGPT=1, with oauth2 securitySchemes and Confirm/Deny-driving annotations", async () => {
+      process.env.CHATGPT2CODEX_CONTROL_CHATGPT = "1";
+      const server = await createServer(makeCtx());
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers?: Map<
+            string,
+            (request: { method: string; params: Record<string, never> }) => Promise<{
+              tools: Array<{
+                name: string;
+                annotations?: Record<string, unknown>;
+                securitySchemes?: Array<{ type?: string; scopes?: string[] }>;
+                _meta?: Record<string, unknown>;
+              }>;
+            }>
+          >;
+        }
+      )._requestHandlers?.get("tools/list");
+      const listed = await handler?.({ method: "tools/list", params: {} });
+      const byName = new Map((listed?.tools ?? []).map((t) => [t.name, t]));
+
+      for (const name of CONTROL_TOOL_NAMES) {
+        const tool = byName.get(name);
+        expect(tool, name).toBeDefined();
+        expect(tool?.securitySchemes, name).toMatchObject([{ type: "oauth2", scopes: ["chatgpt2codex"] }]);
+        expect(tool?._meta?.["openai/visibility"], name).toBe("public");
+      }
+
+      // request_action / kill_switch / screenshot must drive ChatGPT's
+      // client-side Confirm/Deny prompt (non-read-only, destructive);
+      // action_status is a pure read and must not prompt.
+      expect(byName.get("computer_request_action")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+      expect(byName.get("computer_kill_switch")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+      expect(byName.get("computer_screenshot")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+      expect(byName.get("computer_action_status")?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    });
   });
 });

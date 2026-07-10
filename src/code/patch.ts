@@ -300,14 +300,14 @@ export async function applyPatch(
 
   for (const op of ops) {
     if (op.action === "add") {
-      const abs = await resolveInProject(root, op.path, { allowSymlink: false });
+      const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
       staged.push({ abs, content: op.content });
       applied.push({ path: op.path, action: "add", added: op.content.split("\n").length, removed: 0 });
       continue;
     }
 
     if (op.action === "delete") {
-      const abs = await resolveInProject(root, op.path, { allowSymlink: false });
+      const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
       await enforcePrecondition(abs, op.path, preconditionHashes);
       staged.push({ abs, content: null });
       applied.push({ path: op.path, action: "delete", added: 0, removed: 0 });
@@ -315,7 +315,7 @@ export async function applyPatch(
     }
 
     if (op.action === "update") {
-      const abs = await resolveInProject(root, op.path, { allowSymlink: false });
+      const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
       await enforcePrecondition(abs, op.path, preconditionHashes);
       const original = await fs.readFile(abs, "utf8");
       const next = applyHunks(original, op.hunks);
@@ -326,9 +326,9 @@ export async function applyPatch(
     }
 
     if (op.action === "move") {
-      const abs = await resolveInProject(root, op.path, { allowSymlink: false });
+      const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
       await enforcePrecondition(abs, op.path, preconditionHashes);
-      const newAbs = await resolveInProject(root, op.newPath, { allowSymlink: false });
+      const newAbs = await resolveInProject(root, op.newPath, { allowSymlink: false, rejectRoot: true });
       const original = await fs.readFile(abs, "utf8");
       const next = op.hunks.length > 0 ? applyHunks(original, op.hunks) : original;
       staged.push({ abs, content: null }); // remove old location
@@ -435,7 +435,7 @@ export async function createFile(
     throw new DomainError(ErrorCode.NULLBYTE_REJECTED, "Content contains a null byte");
   }
 
-  const abs = await resolveInProject(root, rel, { allowSymlink: false });
+  const abs = await resolveInProject(root, rel, { allowSymlink: false, rejectRoot: true });
 
   if (!overwrite) {
     const exists = await fileExists(abs);

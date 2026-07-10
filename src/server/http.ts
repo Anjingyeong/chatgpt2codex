@@ -370,7 +370,12 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
           if (closedSessionId) sessions.delete(closedSessionId);
         };
 
-        const mcpServer = await createMcpServer(ctx);
+        // Mark this session remote: it's how ChatGPT (and any other network
+        // MCP client) connects, so project_select preset=control must be
+        // refused here even when the desktop-control tools are exposed to
+        // ChatGPT (see src/server/tools.ts project_select handler /
+        // isControlChatGptExposed) — lease arming stays local-only (stdio).
+        const mcpServer = await createMcpServer({ ...ctx, remote: true });
         await mcpServer.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");

@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { DomainError, ErrorCode } from "../types.js";
 import { resolveInProject } from "../policy/paths.js";
+import { isSecretPath } from "../policy/secrets.js";
 import { detect, writeImageMetadata, writeVersionedImage, type SavedImage } from "./images.js";
 
 const execFileAsync = promisify(execFile);
@@ -17,20 +18,6 @@ const MAX_LOCAL_IMAGE_BYTES = 50 * 1024 * 1024;
 
 const DEFAULT_IMAGE_DIR = path.join(".chatgpt2codex", "images");
 const DOWNLOAD_IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif)$/i;
-const WINDOWS_CLIPBOARD_IMAGE_SCRIPT = `
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$out = [string]$args[0]
-if ([string]::IsNullOrWhiteSpace($out)) { throw 'missing output path' }
-$image = [System.Windows.Forms.Clipboard]::GetImage()
-if ($null -eq $image) { exit 2 }
-try {
-  $image.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
-} finally {
-  $image.Dispose()
-}
-`;
 
 export interface IntakeResult {
   filePath: string;
@@ -58,36 +45,10 @@ function timestampSlug(): string {
 
 async function commandExists(cmd: string): Promise<boolean> {
   try {
-    if (process.platform === "win32") {
-      await execFileAsync("where.exe", [cmd], { timeout: 3000 });
-    } else {
-      await execFileAsync("/usr/bin/which", [cmd], { timeout: 3000 });
-    }
+    await execFileAsync("/usr/bin/which", [cmd], { timeout: 3000 });
     return true;
   } catch {
     return false;
-  }
-}
-
-function powerShellExe(): string {
-  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
-  if (systemRoot) {
-    return path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  }
-  return "powershell.exe";
-}
-
-async function execPowerShellSta(script: string, args: string[]): Promise<void> {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-ps-"));
-  const scriptPath = path.join(tmpDir, "script.ps1");
-  try {
-    await fs.writeFile(scriptPath, script, "utf8");
-    await execFileAsync(powerShellExe(), ["-NoProfile", "-Sta", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args], {
-      timeout: 10_000,
-      windowsHide: true,
-    });
-  } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -143,7 +104,7 @@ async function writeIntakeResult(
 // ---------------------------------------------------------------------------
 
 const CLIPBOARD_NO_IMAGE_MESSAGE =
-  "No image was captured from the clipboard. Install pngpaste on macOS, use Windows Copy Image, or use a downloaded file / image path instead.";
+  "No image was captured from the clipboard. Install pngpaste on macOS, or use a downloaded file / image path instead.";
 
 export async function readClipboardText(): Promise<string | undefined> {
   return undefined;
@@ -153,17 +114,6 @@ async function tryPngpaste(tmpFile: string): Promise<boolean> {
   if (!(await commandExists("pngpaste"))) return false;
   try {
     await execFileAsync("pngpaste", [tmpFile], { timeout: 10_000 });
-    const st = await fs.stat(tmpFile).catch(() => null);
-    return !!st && st.size > 0;
-  } catch {
-    return false;
-  }
-}
-
-async function tryWindowsClipboardImage(tmpFile: string): Promise<boolean> {
-  if (process.platform !== "win32") return false;
-  try {
-    await execPowerShellSta(WINDOWS_CLIPBOARD_IMAGE_SCRIPT, [tmpFile]);
     const st = await fs.stat(tmpFile).catch(() => null);
     return !!st && st.size > 0;
   } catch {
@@ -187,7 +137,7 @@ export async function intakeFromClipboard(
   const tmpFile = path.join(tmpDir, "clipboard-image");
 
   try {
-    const got = process.platform === "win32" ? await tryWindowsClipboardImage(tmpFile) : await tryPngpaste(tmpFile);
+    const got = await tryPngpaste(tmpFile);
 
     if (!got) {
       throw new DomainError(ErrorCode.INVALID_IMAGE_DATA, CLIPBOARD_NO_IMAGE_MESSAGE);
@@ -295,6 +245,18 @@ export async function intakeFromPath(
   if (!st.isFile()) {
     throw new DomainError(ErrorCode.NOT_A_FILE, `Source path is not a regular file: ${absSource}`, { path: absSource });
   }
+  // Defense in depth: this intake path reads from anywhere on disk (that's
+  // its purpose — importing a local image from outside the project), with
+  // no resolveInProject confinement. isSecretPath does not cover general
+  // photo/screenshot leak surfaces, but it costs nothing to also refuse the
+  // same secret-classified path patterns every other read path in this
+  // codebase refuses (.env, *.pem, *.key, id_rsa*, .aws/.ssh/gcloud dirs,
+  // *token*/*secret*/*credential*).
+  if (isSecretPath(absSource)) {
+    throw new DomainError(ErrorCode.SECRET_BLOCKED, `Refusing to read a secret-classified path: ${absSource}`, {
+      path: absSource,
+    });
+  }
 
   const bytes = await readValidatedFile(absSource, MAX_LOCAL_IMAGE_BYTES);
   detect(bytes); // throws UNSUPPORTED_MEDIA_TYPE if magic bytes don't match
@@ -308,25 +270,16 @@ export async function intakeFromPath(
 
 export interface IntakeAvailability {
   pngpasteAvailable: boolean;
-  windowsClipboardAvailable: boolean;
-  clipboardImageAvailable: boolean;
   downloadsDirExists: boolean;
 }
 
 export async function checkIntakeAvailability(): Promise<IntakeAvailability> {
-  const [pngpasteAvailable, powershellAvailable, downloadsDirExists] = await Promise.all([
+  const [pngpasteAvailable, downloadsDirExists] = await Promise.all([
     commandExists("pngpaste"),
-    process.platform === "win32" ? commandExists("powershell.exe") : Promise.resolve(false),
     fs
       .stat(path.join(os.homedir(), "Downloads"))
       .then((s) => s.isDirectory())
       .catch(() => false),
   ]);
-  const windowsClipboardAvailable = process.platform === "win32" && powershellAvailable;
-  return {
-    pngpasteAvailable,
-    windowsClipboardAvailable,
-    clipboardImageAvailable: pngpasteAvailable || windowsClipboardAvailable,
-    downloadsDirExists,
-  };
+  return { pngpasteAvailable, downloadsDirExists };
 }

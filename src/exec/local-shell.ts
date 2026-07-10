@@ -18,14 +18,38 @@ const SECRET_COMMAND_PATTERNS = [
   /id_rsa|id_ed25519|private[_-]?key/i,
   /security\s+find-(generic|internet)-password/i,
   /keychain/i,
+  /(^|[\s/"'])\.netrc([\s/"'.]|$)/i,
+  /(^|[\s/"'])\.git-credentials([\s/"']|$)/i,
+  /(^|[\s/"'])\.aws([\s/"']|$)/i,
+  /(^|[\s/"'])\.gnupg([\s/"']|$)/i,
+  /(^|[\s/"'])\.docker([\s/"']|$)/i,
+  /(^|[\s/"'])\.kube([\s/"']|$)/i,
+  /(^|[\s/"'])\.config[/\\]gcloud([\s/"']|$)/i,
+  /(^|[\s/"'])credentials([\s/"'.]|$)/i,
 ];
 
 const OS_DESTRUCTIVE_PATTERNS = [
   /\bsudo\b/i,
-  /\brm\s+-[^;\n]*r[^;\n]*f[^;\n]*\//i,
+  // `rm -rf` / `rm -fr` in either flag order, with or without a trailing
+  // slash on the target — the previous pattern required a literal `/`
+  // after the flags, so `rm -rf *`, `rm -rf .`, and `rm -rf $DIR` (no
+  // trailing slash) all slipped through.
+  /\brm\s+-\w*r\w*f\w*\b|\brm\s+-\w*f\w*r\w*\b/i,
+  /\bfind\b[^\n]*-delete\b/i,
+  /\bgit\s+clean\b/i,
+  // Redirecting into a block/char device (disk overwrite risk) — but not
+  // `> /dev/null`, which is a common, harmless "discard output" idiom.
+  />\s*\/dev\/(?!null\b)\S+/i,
+  /\bdd\b[^\n]*\bof=\/dev\//i,
   /\bdiskutil\s+erase/i,
   /\bmkfs\b/i,
   /\bshutdown\b|\breboot\b/i,
+];
+
+const NETWORK_COMMAND_PATTERNS = [
+  /\b(curl|wget|nc|ncat|netcat|telnet|scp|sftp|ftp|ssh)\b/i,
+  /\b(npm|pnpm|yarn|bun)\s+(install|add|update)\b/i,
+  /\bgit\s+(pull|fetch|clone|push)\b/i,
 ];
 
 function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
@@ -55,6 +79,20 @@ export function guardShellCommand(command: string): void {
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
         "local_shell_run blocked an OS-level destructive command",
+      );
+    }
+  }
+  // The caller (src/server/tools.ts local_shell_run) only requires approval
+  // when the model *self-declares* intent.needsNetwork/destructive — a
+  // prompt-injected model can simply omit that flag. Make this guard, not
+  // the declared intent, the actual authority for network/egress commands:
+  // reject them here unconditionally, matching how a declared needsNetwork
+  // is already always rejected by the caller.
+  for (const pattern of NETWORK_COMMAND_PATTERNS) {
+    if (pattern.test(command)) {
+      throw new DomainError(
+        ErrorCode.APPROVAL_REQUIRED,
+        "local_shell_run blocked a network/egress command that requires explicit approval",
       );
     }
   }

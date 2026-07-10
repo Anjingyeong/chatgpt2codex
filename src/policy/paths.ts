@@ -14,7 +14,7 @@ import { DomainError, ErrorCode } from "../types.js";
 export async function resolveInProject(
   root: string,
   rel: string,
-  opts?: { allowSymlink?: boolean },
+  opts?: { allowSymlink?: boolean; rejectRoot?: boolean },
 ): Promise<string> {
   const allowSymlink = opts?.allowSymlink ?? false;
 
@@ -44,7 +44,18 @@ export async function resolveInProject(
   // A relative path that escapes the root (starts with ".." or is
   // absolute-looking after relative()) is rejected immediately.
   if (relFromRoot === "") {
-    // rel resolves to the root itself — allowed (e.g. "." or "").
+    // rel resolves to the root itself. Some callers (write/create paths)
+    // must reject this explicitly: an unguarded write to `realRoot` (e.g.
+    // rel === "" or ".") writes into the project's *parent* directory once
+    // path.dirname(realRoot) is used as the write dir — see
+    // src/code/patch.ts applyPatch/createFile. Read-style callers keep the
+    // existing "." / "" === root behavior.
+    if (opts?.rejectRoot) {
+      throw new DomainError(ErrorCode.PATH_OUTSIDE_PROJECT, "path must not resolve to the project root itself", {
+        root: realRoot,
+        rel,
+      });
+    }
     return realRoot;
   }
   if (relFromRoot.startsWith("..") || path.isAbsolute(relFromRoot)) {

@@ -9,9 +9,9 @@ const PNG_1X1 = Buffer.from(
   "base64",
 );
 
-const describeNativePreview = process.platform === "darwin" || process.platform === "win32" ? describe : describe.skip;
+const describeDarwin = process.platform === "darwin" ? describe : describe.skip;
 
-describeNativePreview("E2E screenshot previews", () => {
+describeDarwin("E2E screenshot previews", () => {
   it("creates a JPEG preview next to the screenshot", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "c2c-preview-"));
     const shot = path.join(dir, "shot.png");

@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import Foundation
 import Security
@@ -77,6 +78,24 @@ private let desktopLocalizationRows: [String: [String]] = [
     "screenshotPermissionReadyInfo": ["Screen Recording permission is already allowed. E2E screenshots can be captured and returned inline.", "화면 기록 권한이 이미 허용되어 있습니다. E2E 스크린샷을 캡처해 인라인으로 제공할 수 있습니다."],
     "openPrivacySettings": ["Open Privacy Settings", "개인정보 설정 열기"],
     "requestPermission": ["Request Permission", "권한 요청"],
+    "accessibilityPermissionMenu": ["Accessibility Permission...", "손쉬운 사용 권한..."],
+    "accessibilityPermissionTitle": ["Accessibility permission", "손쉬운 사용 권한"],
+    "accessibilityPermissionMissingInfo": ["ChatGPT To Codex needs macOS Accessibility permission to perform approved desktop-control clicks, typing, and key presses. Enable ChatGPT To Codex in System Settings > Privacy & Security > Accessibility, then restart the app if macOS asks for it.", "승인된 데스크톱 제어 클릭·입력·키 입력을 실행하려면 macOS 손쉬운 사용 권한이 필요합니다. 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 ChatGPT To Codex를 허용하고, macOS가 요청하면 앱을 재시작하세요."],
+    "accessibilityPermissionReadyInfo": ["Accessibility permission is already allowed. Approved control actions can be executed.", "손쉬운 사용 권한이 이미 허용되어 있습니다. 승인된 제어 작업을 실행할 수 있습니다."],
+    "pendingControlActionsMenu": ["Pending control actions", "대기 중인 제어 작업"],
+    "controlNoPendingActions": ["No pending actions", "대기 중인 작업 없음"],
+    "controlApprove": ["Approve", "승인"],
+    "controlReject": ["Reject", "거부"],
+    "agentArmStatusMenu": ["Agent Arm: local approval required", "Agent Arm: 로컬 승인 필요"],
+    "agentArmStatusDetail": ["Remote ChatGPT can request control actions, but execution still requires this Mac's control lease, allowlist, sensitive-app checks, and kill switch.", "원격 ChatGPT는 제어 작업을 요청할 수 있지만 실행에는 이 Mac의 제어 lease, 허용 목록, 민감 앱 검사, kill switch가 계속 필요합니다."],
+    "killControlMenu": ["Kill Control", "제어 강제 종료"],
+    "killControlConfirmTitle": ["Kill control session?", "제어 세션을 강제 종료할까요?"],
+    "killControlConfirmInfo": ["This immediately rejects every pending control action and blocks new ones until a fresh control lease is granted.", "대기 중인 모든 제어 작업을 즉시 거부하고, 새 제어 lease를 부여하기 전까지 새 작업을 차단합니다."],
+    "approveAllControlMenu": ["Approve all pending", "대기 중인 작업 모두 승인"],
+    "autoApproveOnMenu": ["Turn on auto-approve (10 min)", "자동 승인 켜기 (10분)"],
+    "autoApproveOffMenu": ["Turn off auto-approve", "자동 승인 끄기"],
+    "autoApproveStatusMenu": ["Auto-approve: on", "자동 승인: 켜짐"],
+    "autoApproveUnavailableMenu": ["Auto-approve needs an allowlisted app (CHATGPT2CODEX_CONTROL_ALLOWLIST)", "자동 승인을 사용하려면 허용 목록(CHATGPT2CODEX_CONTROL_ALLOWLIST) 앱이 필요합니다"],
     "autoUpdatesMenu": ["Auto Check for Updates", "업데이트 자동 확인", "更新を自動確認", "自动检查更新", "自動檢查更新", "Buscar actualizaciones automáticamente", "Recherche auto des mises à jour", "Automatisch nach Updates suchen", "Verificar atualizações automaticamente", "Controlla aggiornamenti automaticamente", "Automatisch updates zoeken", "Automatycznie sprawdzaj aktualizacje", "Автопроверка обновлений", "Güncellemeleri otomatik denetle", "Tự động kiểm tra cập nhật", "Periksa pembaruan otomatis", "ตรวจอัปเดตอัตโนมัติ", "التحقق التلقائي من التحديثات", "अपडेट अपने-आप जांचें", "Автоматично перевіряти оновлення"],
     "openLocalHealth": ["Open Local Health", "로컬 상태 열기", "ローカルヘルスを開く", "打开本地健康检查", "開啟本機健康檢查", "Abrir estado local", "Ouvrir l'état local", "Lokalen Status öffnen", "Abrir saúde local", "Apri stato locale", "Lokale status openen", "Otwórz status lokalny", "Открыть локальный статус", "Yerel durumu aç", "Mở trạng thái cục bộ", "Buka kesehatan lokal", "เปิดสถานะภายใน", "فتح حالة الجهاز", "स्थानीय हेल्थ खोलें", "Відкрити локальний стан"],
     "openPublicHealth": ["Open Public Health", "공개 상태 열기", "公開ヘルスを開く", "打开公开健康检查", "開啟公開健康檢查", "Abrir estado público", "Ouvrir l'état public", "Öffentlichen Status öffnen", "Abrir saúde pública", "Apri stato pubblico", "Publieke status openen", "Otwórz status publiczny", "Открыть публичный статус", "Genel durumu aç", "Mở trạng thái công khai", "Buka kesehatan publik", "เปิดสถานะสาธารณะ", "فتح الحالة العامة", "सार्वजनिक हेल्थ खोलें", "Відкрити публічний стан"],
@@ -187,8 +206,6 @@ private final class ServiceController {
     private let startMCPOnLaunchKey = "startMCPOnLaunch"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
     private(set) var process: Process?
-    private var currentQuickTunnelBaseURL: URL?
-    private var quickTunnelLogBuffer = ""
 
     let appName = "ChatGPT To Codex"
     let defaultWorkspace: String
@@ -317,6 +334,189 @@ private final class ServiceController {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    /// Whether Option B desktop control is enabled at all, mirroring
+    /// src/control/policy.ts isControlEnabled(). Enabled by default (even
+    /// with no environment configured, e.g. launched via `open`); set
+    /// CHATGPT2CODEX_CONTROL to "0"/"false"/"off" (case-insensitive) to opt
+    /// out. This environment is also what launchServer()/runDoctor() forward
+    /// to the managed `chatgpt2codex serve` subprocess, so this check tracks
+    /// exactly what the subprocess itself would see.
+    var controlEnabled: Bool {
+        guard let raw = environment["CHATGPT2CODEX_CONTROL"] else { return true }
+        let normalized = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        return normalized != "0" && normalized != "false" && normalized != "off"
+    }
+
+    var accessibilityTrusted: Bool {
+        AXIsProcessTrusted()
+    }
+
+    /// Prompts the user via the system Accessibility-permission dialog
+    /// (kAXTrustedCheckOptionPrompt). Returns the trust state at call time.
+    @discardableResult
+    func requestAccessibilityPermission() -> Bool {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
+
+    func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    struct PendingControlAction {
+        let actionId: String
+        let appName: String
+        let kind: String
+        let targetSummary: String
+        /// Human-readable dry-run AX resolve preview (src/control/queue.ts
+        /// ResolvedTargetPreview), or nil when the target has no `ax` field.
+        /// Always safe to display: never contains the raw `text` payload.
+        let resolvedSummary: String?
+    }
+
+    private func summarizeControlTarget(_ target: [String: Any]?) -> String {
+        guard let target else { return "" }
+        if let ax = target["ax"] as? [String: Any] {
+            let role = ax["role"] as? String ?? "element"
+            if let label = (ax["title"] as? String) ?? (ax["label"] as? String), !label.isEmpty {
+                return "\(role) \"\(label)\""
+            }
+            return role
+        }
+        if let point = target["windowPoint"] as? [String: Any],
+           let xRel = point["xRel"] as? Double, let yRel = point["yRel"] as? Double {
+            return String(format: "point (%.2f, %.2f)", xRel, yRel)
+        }
+        return ""
+    }
+
+    /// Renders the read-only AX resolve preview (src/control/queue.ts
+    /// ResolvedTargetPreview / src/control/mac-input.ts resolveAxElement) as
+    /// a human sentence for the approval UI, e.g. "Will act on button
+    /// \"Send\" at (120, 340, 80, 24) in Slack/Message a channel, 1 match" or
+    /// "No accessibility match found (empty/opt-out AX tree) - expect a
+    /// windowPoint fallback" when resolve failed.
+    private func summarizeResolvedPreview(_ resolved: [String: Any]?) -> String? {
+        guard let resolved else { return nil }
+        let found = resolved["found"] as? Bool ?? false
+        guard found else {
+            let reason = resolved["reason"] as? String ?? "not found"
+            return "No accessibility match found (\(reason)) — expect a windowPoint fallback"
+        }
+        let role = resolved["role"] as? String ?? "element"
+        let label = (resolved["title"] as? String) ?? (resolved["description"] as? String)
+        var target = label.map { "\(role) \"\($0)\"" } ?? role
+        if let frame = resolved["frame"] as? [String: Any],
+           let x = frame["x"] as? Double, let y = frame["y"] as? Double,
+           let w = frame["width"] as? Double, let h = frame["height"] as? Double {
+            target += String(format: " at (%.0f, %.0f, %.0f, %.0f)", x, y, w, h)
+        }
+        var location = ""
+        if let app = resolved["app"] as? String { location = app }
+        if let window = resolved["window"] as? String, !window.isEmpty {
+            location = location.isEmpty ? window : "\(location)/\(window)"
+        }
+        if !location.isEmpty { target += " in \(location)" }
+        if let matchCount = resolved["matchCount"] as? Int {
+            target += ", \(matchCount) match\(matchCount == 1 ? "" : "es")"
+        }
+        return "Will act on \(target)"
+    }
+
+    /// `chatgpt2codex control list`, filtered to actions still awaiting local
+    /// human approval. See src/control/queue.ts listActions/toSummary.
+    func listPendingControlActions() -> [PendingControlAction] {
+        guard let result = try? runCli(["control", "list"]), result.status == 0,
+              let data = result.stdout.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else {
+            return []
+        }
+        return array.compactMap { entry in
+            guard entry["status"] as? String == "pending", let actionId = entry["actionId"] as? String else {
+                return nil
+            }
+            return PendingControlAction(
+                actionId: actionId,
+                appName: entry["appName"] as? String ?? "",
+                kind: entry["kind"] as? String ?? "",
+                targetSummary: summarizeControlTarget(entry["target"] as? [String: Any]),
+                resolvedSummary: summarizeResolvedPreview(entry["resolved"] as? [String: Any])
+            )
+        }
+    }
+
+    /// `chatgpt2codex control approve <actionId>`.
+    @discardableResult
+    func approveControlAction(_ actionId: String) -> Bool {
+        (try? runCli(["control", "approve", actionId]))?.status == 0
+    }
+
+    /// `chatgpt2codex control reject <actionId>`.
+    @discardableResult
+    func rejectControlAction(_ actionId: String) -> Bool {
+        (try? runCli(["control", "reject", actionId]))?.status == 0
+    }
+
+    /// `chatgpt2codex control kill`: rejects every pending action and blocks
+    /// new ones until a fresh control lease is granted.
+    @discardableResult
+    func killControl() -> Bool {
+        (try? runCli(["control", "kill"]))?.status == 0
+    }
+
+    /// `chatgpt2codex control approve-all`: local-human batch-approve of
+    /// every currently pending action. The CLI itself re-skips any
+    /// sensitive-app/non-allowlisted target and stops on a kill, so this is
+    /// never a way to approve something a single `control approve` couldn't.
+    @discardableResult
+    func approveAllControlActions() -> Bool {
+        (try? runCli(["control", "approve-all"]))?.status == 0
+    }
+
+    /// The same `CHATGPT2CODEX_CONTROL_ALLOWLIST` the managed subprocess
+    /// sees (src/control/policy.ts controlAllowlist), read here only to
+    /// supply `--apps` for the status-bar auto-approve toggle below — this
+    /// never widens the scope beyond what the operator already allowlisted.
+    var controlAllowlistApps: [String] {
+        (environment["CHATGPT2CODEX_CONTROL_ALLOWLIST"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// `chatgpt2codex control auto status`.
+    func autoApproveStatus() -> (enabled: Bool, remainingMs: Int) {
+        guard let result = try? runCli(["control", "auto", "status"]), result.status == 0,
+              let data = result.stdout.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return (false, 0)
+        }
+        return (obj["autoEnabled"] as? Bool ?? false, obj["remainingMs"] as? Int ?? 0)
+    }
+
+    /// `chatgpt2codex control auto on --apps <allowlist>`. Local-human-only
+    /// entrypoint: this status-bar toggle never writes the AUTO scope file
+    /// itself, it only shells out to the same CLI a terminal user would run.
+    /// Scope is always the live control allowlist, so toggling this can
+    /// never reach an app the operator hasn't already explicitly allowed.
+    @discardableResult
+    func enableAutoApprove() -> Bool {
+        let apps = controlAllowlistApps
+        guard !apps.isEmpty else { return false }
+        return (try? runCli(["control", "auto", "on", "--apps", apps.joined(separator: ",")]))?.status == 0
+    }
+
+    /// `chatgpt2codex control auto off`.
+    @discardableResult
+    func disableAutoApprove() -> Bool {
+        (try? runCli(["control", "auto", "off"]))?.status == 0
     }
 
     private var cliScript: URL {
@@ -498,7 +698,7 @@ private final class ServiceController {
         if let publicHost {
             return URL(string: "https://\(publicHost)")
         }
-        return currentQuickTunnelBaseURL
+        return discoverQuickTunnelBaseURL()
     }
 
     var connectorURL: URL? {
@@ -550,8 +750,6 @@ private final class ServiceController {
             process.terminate()
         }
         process = nil
-        currentQuickTunnelBaseURL = nil
-        quickTunnelLogBuffer = ""
 
         let startPattern = shellQuote("start-chatgpt.sh")
         let servePattern = shellQuote("dist/cli.js serve --http --port \(port)")
@@ -577,10 +775,6 @@ private final class ServiceController {
             throw NSError(domain: "ChatGPTToCodex", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "start-chatgpt.sh not found at \(script.path)"
             ])
-        }
-        if enablePublicTunnel && publicHost == nil {
-            currentQuickTunnelBaseURL = nil
-            quickTunnelLogBuffer = ""
         }
 
         let command = """
@@ -621,10 +815,6 @@ private final class ServiceController {
             DispatchQueue.main.async {
                 if self?.process === process {
                     self?.process = nil
-                    if self?.publicHost == nil {
-                        self?.currentQuickTunnelBaseURL = nil
-                        self?.quickTunnelLogBuffer = ""
-                    }
                 }
             }
         }
@@ -645,31 +835,25 @@ private final class ServiceController {
     }
 
     private func appendLogMirror(_ text: String) {
-        captureQuickTunnelBaseURL(from: text)
         if text.contains("chatgpt2codex is ready") || text.contains("exited") || text.contains("missing command") {
             NSLog("%@", text)
         }
     }
 
-    private func captureQuickTunnelBaseURL(from text: String) {
-        guard enablePublicTunnel, publicHost == nil else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.quickTunnelLogBuffer += text
-            if self.quickTunnelLogBuffer.count > 65536 {
-                self.quickTunnelLogBuffer = String(self.quickTunnelLogBuffer.suffix(65536))
-            }
-            guard let regex = try? NSRegularExpression(pattern: #"https://[A-Za-z0-9.-]+\.trycloudflare\.com"#) else {
-                return
-            }
-            let range = NSRange(self.quickTunnelLogBuffer.startIndex..<self.quickTunnelLogBuffer.endIndex, in: self.quickTunnelLogBuffer)
-            guard let match = regex.matches(in: self.quickTunnelLogBuffer, range: range).last,
-                  let matchRange = Range(match.range, in: self.quickTunnelLogBuffer)
-            else {
-                return
-            }
-            self.currentQuickTunnelBaseURL = URL(string: String(self.quickTunnelLogBuffer[matchRange]))
+    private func discoverQuickTunnelBaseURL() -> URL? {
+        guard let data = try? Data(contentsOf: logFile),
+              let text = String(data: data, encoding: .utf8),
+              let regex = try? NSRegularExpression(pattern: #"https://[A-Za-z0-9.-]+\.trycloudflare\.com"#)
+        else {
+            return nil
         }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.matches(in: text, range: range).last,
+              let matchRange = Range(match.range, in: text)
+        else {
+            return nil
+        }
+        return URL(string: String(text[matchRange]))
     }
 
     func checkForUpdates(completion: @escaping (String, URL?) -> Void) {
@@ -762,7 +946,7 @@ private final class ServiceController {
     }
 }
 
-private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
+private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let controller = ServiceController()
     private var statusItem: NSStatusItem!
     private var statusMenuItem = NSMenuItem(title: "ChatGPT To Codex: checking...", action: nil, keyEquivalent: "")
@@ -772,7 +956,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
     private var restartItem = NSMenuItem()
     private var openPublicHealthItem = NSMenuItem()
     private var copyConnectorItem = NSMenuItem()
+    private var pendingControlSubmenu: NSMenu?
     private var timer: Timer?
+    private var killHotkeyGlobalMonitor: Any?
+    private var killHotkeyLocalMonitor: Any?
     private var latestHealth = false
     private var settingsWindow: NSWindow?
     private var logWindow: NSWindow?
@@ -808,6 +995,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
         }
         rebuildMenu()
         refreshStatus()
+        registerGlobalKillHotkeyIfNeeded()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.promptScreenRecordingPermissionIfNeeded(force: false)
         }
@@ -836,6 +1024,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        if let monitor = killHotkeyGlobalMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = killHotkeyLocalMonitor { NSEvent.removeMonitor(monitor) }
         controller.stop()
     }
 
@@ -847,6 +1037,32 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(statusMenuItem)
         menu.addItem(.separator())
 
+        // Desktop-control (Option B) human-approval surface. Hidden entirely
+        // when the feature flag is off, matching src/control/policy.ts
+        // isControlEnabled(): doing nothing means these tools are never
+        // reachable and this UI has nothing to show. The kill switch is
+        // placed at the very top of the control section so it is reachable
+        // in one click without hunting through a submenu.
+        if controller.controlEnabled {
+            let armItem = NSMenuItem(title: t("agentArmStatusMenu"), action: nil, keyEquivalent: "")
+            armItem.isEnabled = false
+            armItem.image = symbol("shield.lefthalf.filled")
+            armItem.toolTip = t("agentArmStatusDetail")
+            menu.addItem(armItem)
+
+            let killItem = menuItem(t("killControlMenu"), #selector(killControlAction), "hand.raised.fill")
+            menu.addItem(killItem)
+
+            let pendingSubmenu = NSMenu()
+            pendingSubmenu.delegate = self
+            pendingControlSubmenu = pendingSubmenu
+            let pendingItem = NSMenuItem(title: t("pendingControlActionsMenu"), action: nil, keyEquivalent: "")
+            pendingItem.image = symbol("checklist")
+            pendingItem.submenu = pendingSubmenu
+            menu.addItem(pendingItem)
+            menu.addItem(.separator())
+        }
+
         toggleItem = NSMenuItem(title: t("startMCP"), action: #selector(toggleServer), keyEquivalent: "s")
         toggleItem.target = self
         toggleItem.image = symbol("play.circle")
@@ -856,8 +1072,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
         restartItem.target = self
         restartItem.image = symbol("arrow.clockwise.circle")
         menu.addItem(restartItem)
-        menu.addItem(menuItem(t("settingsMenu"), #selector(showSettings), "gearshape"))
         menu.addItem(menuItem(t("screenshotPermissionMenu"), #selector(showScreenRecordingPermission), "camera.viewfinder"))
+        if controller.controlEnabled {
+            menu.addItem(menuItem(t("accessibilityPermissionMenu"), #selector(showAccessibilityPermission), "figure.roll"))
+        }
+        menu.addItem(menuItem(t("settingsMenu"), #selector(showSettings), "gearshape"))
         menu.addItem(.separator())
         menu.addItem(menuItem(t("quit"), #selector(quit), "power"))
         statusItem.menu = menu
@@ -994,6 +1213,173 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showScreenRecordingPermission() {
         promptScreenRecordingPermissionIfNeeded(force: true)
+    }
+
+    @objc private func showAccessibilityPermission() {
+        if controller.accessibilityTrusted {
+            let readyAlert = NSAlert()
+            readyAlert.messageText = t("accessibilityPermissionTitle")
+            readyAlert.informativeText = t("accessibilityPermissionReadyInfo")
+            readyAlert.alertStyle = .informational
+            readyAlert.addButton(withTitle: t("ok"))
+            NSApp.activate(ignoringOtherApps: true)
+            readyAlert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = t("accessibilityPermissionTitle")
+        alert.informativeText = t("accessibilityPermissionMissingInfo")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("openPrivacySettings"))
+        alert.addButton(withTitle: t("requestPermission"))
+        alert.addButton(withTitle: t("ok"))
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            controller.openAccessibilitySettings()
+        } else if response == .alertSecondButtonReturn {
+            if !controller.requestAccessibilityPermission() {
+                controller.openAccessibilitySettings()
+            }
+        }
+    }
+
+    /// NSMenuDelegate: rebuild the pending-control-actions submenu with the
+    /// live queue state each time the user opens it, rather than on a timer,
+    /// so approve/reject always act on current data.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === pendingControlSubmenu else { return }
+        menu.removeAllItems()
+
+        // Auto-approve toggle: local-human-only (runCli(["control", "auto",
+        // ...]) — see ServiceController.enableAutoApprove/disableAutoApprove
+        // above). Shown disabled when the current control allowlist is empty
+        // since there is nothing it could ever scope to.
+        let autoStatus = controller.autoApproveStatus()
+        let autoItem: NSMenuItem
+        if autoStatus.enabled {
+            let minutesLeft = max(1, autoStatus.remainingMs / 60000)
+            autoItem = NSMenuItem(title: "\(t("autoApproveStatusMenu")) (\(minutesLeft)m) — \(t("autoApproveOffMenu"))", action: #selector(toggleAutoApprove), keyEquivalent: "")
+        } else {
+            autoItem = NSMenuItem(title: t("autoApproveOnMenu"), action: #selector(toggleAutoApprove), keyEquivalent: "")
+        }
+        autoItem.target = self
+        autoItem.isEnabled = autoStatus.enabled || !controller.controlAllowlistApps.isEmpty
+        if !autoStatus.enabled && controller.controlAllowlistApps.isEmpty {
+            autoItem.toolTip = t("autoApproveUnavailableMenu")
+        }
+        menu.addItem(autoItem)
+        menu.addItem(.separator())
+
+        let pending = controller.listPendingControlActions()
+        if pending.isEmpty {
+            let empty = NSMenuItem(title: t("controlNoPendingActions"), action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return
+        }
+
+        let approveAll = NSMenuItem(title: t("approveAllControlMenu"), action: #selector(approveAllPendingControlActions), keyEquivalent: "")
+        approveAll.target = self
+        menu.addItem(approveAll)
+        menu.addItem(.separator())
+
+        for action in pending {
+            let summary = [action.appName, action.kind, action.targetSummary].filter { !$0.isEmpty }.joined(separator: " · ")
+            let header = NSMenuItem(title: summary, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+
+            // Dry-run AX resolve preview, shown to the approver before
+            // anything executes (see src/control/tools.ts
+            // handleComputerRequestAction / summarizeResolvedPreview above).
+            if let resolvedSummary = action.resolvedSummary {
+                let preview = NSMenuItem(title: "  \(resolvedSummary)", action: nil, keyEquivalent: "")
+                preview.isEnabled = false
+                menu.addItem(preview)
+            }
+
+            let approve = NSMenuItem(title: "  \(t("controlApprove"))", action: #selector(approvePendingControlAction(_:)), keyEquivalent: "")
+            approve.target = self
+            approve.representedObject = action.actionId
+            menu.addItem(approve)
+
+            let reject = NSMenuItem(title: "  \(t("controlReject"))", action: #selector(rejectPendingControlAction(_:)), keyEquivalent: "")
+            reject.target = self
+            reject.representedObject = action.actionId
+            menu.addItem(reject)
+
+            menu.addItem(.separator())
+        }
+    }
+
+    @objc private func approvePendingControlAction(_ sender: NSMenuItem) {
+        guard let actionId = sender.representedObject as? String else { return }
+        controller.approveControlAction(actionId)
+    }
+
+    @objc private func rejectPendingControlAction(_ sender: NSMenuItem) {
+        guard let actionId = sender.representedObject as? String else { return }
+        controller.rejectControlAction(actionId)
+    }
+
+    @objc private func approveAllPendingControlActions() {
+        controller.approveAllControlActions()
+    }
+
+    /// Local-human-only auto-approve toggle: always shells out to
+    /// `chatgpt2codex control auto on|off` (ServiceController above), never
+    /// writes the AUTO scope file directly.
+    @objc private func toggleAutoApprove() {
+        if controller.autoApproveStatus().enabled {
+            controller.disableAutoApprove()
+        } else {
+            controller.enableAutoApprove()
+        }
+    }
+
+    /// Global emergency-stop hotkey (⌃⌥⌘.) for Option B desktop control:
+    /// pressed anywhere on the system, it calls `chatgpt2codex control kill`
+    /// immediately via the same runCli path as the menu item, with no
+    /// confirmation dialog — unlike the menu's killControlAction, a
+    /// deliberately pressed panic-button combo shouldn't need a second click
+    /// to take effect. Registered only when control is enabled at all
+    /// (isControlEnabled()); doing nothing when it's off means the hotkey is
+    /// never even listened for, matching every other control gate.
+    private func isKillHotkeyEvent(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // kVK_ANSI_Period = 47 on a US layout; deviceIndependentFlagsMask
+        // keeps this keyCode-based match layout-agnostic for the modifiers.
+        return mods == [.control, .option, .command] && event.keyCode == 47
+    }
+
+    private func registerGlobalKillHotkeyIfNeeded() {
+        guard controller.controlEnabled else { return }
+        killHotkeyGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isKillHotkeyEvent(event) else { return }
+            self.controller.killControl()
+        }
+        killHotkeyLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            if self.isKillHotkeyEvent(event) {
+                self.controller.killControl()
+                return nil
+            }
+            return event
+        }
+    }
+
+    @objc private func killControlAction() {
+        let alert = NSAlert()
+        alert.messageText = t("killControlConfirmTitle")
+        alert.informativeText = t("killControlConfirmInfo")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("killControlMenu"))
+        alert.addButton(withTitle: t("cancel"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        controller.killControl()
     }
 
     @objc private func selectProjectFolder() {

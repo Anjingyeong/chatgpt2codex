@@ -8,7 +8,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+try:
+    from PIL import Image, ImageDraw, ImageFilter
+except ModuleNotFoundError:  # Pillow is optional when release assets already exist.
+    Image = ImageDraw = ImageFilter = None  # type: ignore[assignment]
 
 
 SIZES = [16, 32, 64, 128, 256, 512, 1024]
@@ -143,13 +146,28 @@ def main() -> None:
 
     root = Path.cwd()
     out = root / args.out
+    asset_path = root / args.asset
+    icns = out / "AppIcon.icns"
+    status_path = out / "StatusIconTemplate.png"
+    if Image is None:
+        if asset_path.exists() and icns.exists() and status_path.exists():
+            print("warning: Pillow is not installed; reusing existing macOS icon assets.")
+            print(f"wrote {asset_path}")
+            print(f"wrote {icns}")
+            print(f"wrote {status_path}")
+            return
+        raise SystemExit(
+            "Pillow is required to generate macOS icon assets. Install pillow or keep "
+            "assets/chatgpt2codex-icon.png, build/macos/generated-icons/AppIcon.icns, "
+            "and build/macos/generated-icons/StatusIconTemplate.png in place."
+        )
+
     iconset = out / "AppIcon.iconset"
     if iconset.exists():
         shutil.rmtree(iconset)
     iconset.mkdir(parents=True, exist_ok=True)
 
     base = draw_icon(1024)
-    asset_path = root / args.asset
     asset_path.parent.mkdir(parents=True, exist_ok=True)
     base.save(asset_path)
     ico_path = asset_path.with_suffix(".ico")
@@ -165,10 +183,8 @@ def main() -> None:
             retina = base.resize((size * 2, size * 2), Image.Resampling.LANCZOS)
             retina.save(iconset / f"icon_{size}x{size}@2x.png")
 
-    status_path = out / "StatusIconTemplate.png"
     draw_status_icon(status_path, base)
 
-    icns = out / "AppIcon.icns"
     subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], check=True)
     print(f"wrote {asset_path}")
     print(f"wrote {ico_path}")

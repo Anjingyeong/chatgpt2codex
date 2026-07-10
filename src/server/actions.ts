@@ -3,8 +3,10 @@ import { promises as fs } from "node:fs";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
+import { CONTROL_TOOL_NAMES, isControlChatGptExposed } from "../control/policy.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
+import { normalizeObjectSchema, safeParseAsync, getParseErrorMessage } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 
 interface CallToolResultLike {
   content?: Array<{ type?: string; text?: string }>;
@@ -14,6 +16,7 @@ interface CallToolResultLike {
 
 interface RegisteredToolLike {
   handler?: (input: Record<string, unknown>) => Promise<CallToolResultLike>;
+  inputSchema?: unknown;
 }
 
 interface ActionRoute {
@@ -180,7 +183,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "e2e_open_target",
     operationId: "e2e_open_target",
     summary: "Open a URL or local app for E2E",
-    description: "Open a URL, installed app name, or allowed local app path on the local computer before E2E screenshot capture.",
+    description: "Open a URL, installed app name, or allowed local app path on the Mac before E2E screenshot capture.",
     schema: "E2eOpenTargetInput",
   },
   {
@@ -189,7 +192,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_run_command",
     summary: "Run E2E command and capture proof",
     description:
-      "Run a guarded project E2E/test command and capture a macOS or Windows screenshot by default so the user can inspect visual proof.",
+      "Run a guarded project E2E/test command and capture a macOS screenshot by default so the user can inspect visual proof.",
     schema: "E2eRunCommandInput",
   },
   {
@@ -207,7 +210,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_screenshot",
     summary: "Capture an E2E screenshot",
     description:
-      "Capture a macOS or Windows screenshot into the selected project under .chatgpt2codex/e2e/screenshots and return the file path so the user can inspect it.",
+      "Capture a macOS screenshot into the selected project under .chatgpt2codex/e2e/screenshots and return the file path so the user can inspect it.",
     schema: "E2eScreenshotInput",
   },
   {
@@ -288,7 +291,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "save_chatgpt_image",
     summary: "Save a finished ChatGPT image from URL, clipboard, download, or path",
     description:
-      "Device-agnostic import when a ChatGPT Share/Copy Link or content URL is available. Also supports local clipboard/download/path sources. This is the correct Custom GPT path for phone-generated images after the user provides the image URL.",
+      "Device-agnostic import when a ChatGPT Share/Copy Link or content URL is available. Also supports local Mac clipboard/download/path sources. This is the correct Custom GPT path for phone-generated images after the user provides the image URL.",
     schema: "SaveChatGptImageInput",
   },
   {
@@ -399,15 +402,70 @@ async function callRegisteredTool(
   toolName: string,
   input: Record<string, unknown>,
 ): Promise<CallToolResultLike> {
+  // Desktop-control tools are blocked on the generic action bridge (even for
+  // the owner-bearer /actions/call-tool route, even if isControlEnabled() is
+  // on) unless the owner has separately opted in to exposing them to ChatGPT
+  // via CHATGPT2CODEX_CONTROL_CHATGPT (isControlChatGptExposed) — the
+  // public-product default keeps this block in place, matching the
+  // tools/list hide in src/server/tools.ts installChatGptToolListHandler.
+  if (CONTROL_TOOL_NAMES.has(toolName) && !isControlChatGptExposed()) {
+    const message = `Tool ${toolName} is not available through the chatgpt2codex action bridge.`;
+    return {
+      isError: true,
+      structuredContent: { code: "PERMISSION_DENIED", error: message },
+      content: [{ type: "text", text: message }],
+    };
+  }
+  // project_select isn't itself a control tool (so it isn't caught by
+  // CONTROL_TOOL_NAMES above), but preset="control" is the only way to grant
+  // a control lease and clear the kill switch (see src/server/tools.ts
+  // project_select handler / src/control/queue.ts clearKill). A remote
+  // owner-bearer caller must never be able to resume a locally killed
+  // control session or grant itself a control lease through the bridge, so
+  // this is rejected at the single choke point both /actions/call-tool
+  // (genericToolInput) and the per-route bridge (actionInputForRoute) call
+  // through. The local/MCP zod path (registerTool project_select) is
+  // untouched, so a local approver can still grant/resume control normally.
+  if (toolName === "project_select" && input.preset === "control") {
+    const message = "preset=control cannot be granted through the chatgpt2codex action bridge.";
+    await ctx.ledger.append({ type: "control.bridge.rejected", preset: "control" }).catch(() => undefined);
+    return {
+      isError: true,
+      structuredContent: { code: "PERMISSION_DENIED", error: message },
+      content: [{ type: "text", text: message }],
+    };
+  }
   const server = await createMcpServer(ctx);
   const tools = (server as unknown as { _registeredTools?: Record<string, RegisteredToolLike> })._registeredTools;
-  const handler = tools?.[toolName]?.handler;
+  const registered = tools?.[toolName];
+  const handler = registered?.handler;
   if (!handler) {
     return {
       isError: true,
       structuredContent: { code: "TOOL_NOT_FOUND", error: `Tool not found: ${toolName}` },
       content: [{ type: "text", text: `Tool not found: ${toolName}` }],
     };
+  }
+  // This bridge calls the raw registered handler directly, bypassing the
+  // MCP SDK's normal tools/call path (McpServer#validateToolInput), which is
+  // where every tool's zod inputSchema (ranges, enums, refine, min/max) is
+  // actually enforced. Without re-running that validation here, a bridge
+  // caller can send out-of-schema values — e.g. a windowPoint xRel/yRel
+  // outside [0,1], or an invalid enum — straight into the tool handler.
+  // Re-validate against the same registered schema before dispatching.
+  if (registered?.inputSchema) {
+    const objSchema = normalizeObjectSchema(registered.inputSchema as never);
+    const schemaToParse = objSchema ?? registered.inputSchema;
+    const parsed = await safeParseAsync(schemaToParse as never, input);
+    if (!parsed.success) {
+      const message = `Invalid arguments for tool ${toolName}: ${getParseErrorMessage((parsed as { error: unknown }).error)}`;
+      return {
+        isError: true,
+        structuredContent: { code: "INVALID_INPUT", error: message },
+        content: [{ type: "text", text: message }],
+      };
+    }
+    return handler(parsed.data as Record<string, unknown>);
   }
   return handler(input);
 }
@@ -420,11 +478,10 @@ function resultText(result: CallToolResultLike): string {
 }
 
 function isScreenshotRecord(value: unknown): value is Record<string, unknown> {
-  const normalizedPath = isRecord(value) && typeof value.path === "string" ? value.path.replace(/\\/g, "/") : "";
   return (
     isRecord(value) &&
     typeof value.path === "string" &&
-    normalizedPath.includes(`${["", ".chatgpt2codex", "e2e", "screenshots", ""].join("/")}`) &&
+    value.path.includes(`${["", ".chatgpt2codex", "e2e", "screenshots", ""].join("/")}`) &&
     value.path.endsWith(".png")
   );
 }
@@ -495,7 +552,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
         operationId: "call_tool",
         summary: "Call any chatgpt2codex MCP tool",
         description:
-          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local computer; do not try to write local filesystem paths directly from ChatGPT's sandbox. For source edits: select project with preset=full-write, then call file_apply_patch or file_create through this route. The response toolCall object is the required proof that the local tool was actually callable.",
+          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits: select project with preset=full-write, then call file_apply_patch or file_create through this route. The response toolCall object is the required proof that the local tool was actually callable.",
         security: [{ ownerBearer: [] }],
         requestBody: {
           required: true,
@@ -546,7 +603,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
       title: "chatgpt2codex Custom GPT Actions",
       version: "0.1.6",
       description:
-        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools remain reachable through call_tool. ChatGPT's sandbox cannot write local filesystem paths directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
+        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes().map((route) => route.tool),
@@ -777,8 +834,8 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             projectId: { type: "string", description: "Required when appPath is project-relative or screenshot proof should be tied to a project." },
             url: { type: "string" },
-            appName: { type: "string", description: "Installed app/process name, e.g. Safari, Chrome, Notepad, or ChatGPT." },
-            appPath: { type: "string", description: "Absolute application path or project-relative app path." },
+            appName: { type: "string", description: "Installed macOS app name, e.g. Safari or ChatGPT." },
+            appPath: { type: "string", description: "Absolute /Applications path or project-relative .app path." },
             args: { type: "array", items: { type: "string" } },
           },
         },
@@ -831,7 +888,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             projectId: { type: "string" },
             label: { type: "string" },
             waitMs: { type: "integer", minimum: 0, maximum: 30000 },
-            openAfterCapture: { type: "boolean", description: "Open the screenshot on the local computer immediately after capture." },
+            openAfterCapture: { type: "boolean", description: "Open the screenshot on the Mac immediately after capture." },
           },
         },
         E2eOpenUrlScreenshotInput: {

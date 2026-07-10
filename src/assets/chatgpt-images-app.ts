@@ -39,26 +39,15 @@ export type ExecFileLike = (
 export interface PrepareChatGptImagesAppOptions {
   execFileImpl?: ExecFileLike;
   sleepMs?: (ms: number) => Promise<void>;
-  platform?: NodeJS.Platform;
 }
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function openImagesApp(execFileImpl: ExecFileLike, browser: ImagesAppBrowser, platform: NodeJS.Platform): Promise<void> {
-  if (platform === "darwin") {
-    const args = browser === "chrome" ? ["-a", "Google Chrome", CHATGPT_IMAGES_APP_URL] : [CHATGPT_IMAGES_APP_URL];
-    await execFileImpl("/usr/bin/open", args, { timeout: 10_000 });
-    return;
-  }
-  if (platform === "win32") {
-    const command =
-      browser === "chrome" ? `start "" chrome "${CHATGPT_IMAGES_APP_URL}"` : `start "" "${CHATGPT_IMAGES_APP_URL}"`;
-    await execFileImpl(process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe", ["/d", "/s", "/c", command], { timeout: 10_000 });
-    return;
-  }
-  await execFileImpl("xdg-open", [CHATGPT_IMAGES_APP_URL], { timeout: 10_000 });
+async function openImagesApp(execFileImpl: ExecFileLike, browser: ImagesAppBrowser): Promise<void> {
+  const args = browser === "chrome" ? ["-a", "Google Chrome", CHATGPT_IMAGES_APP_URL] : [CHATGPT_IMAGES_APP_URL];
+  await execFileImpl("/usr/bin/open", args, { timeout: 10_000 });
 }
 
 export async function prepareChatGptImagesApp(
@@ -67,7 +56,6 @@ export async function prepareChatGptImagesApp(
 ): Promise<PrepareChatGptImagesAppResult> {
   const execFileImpl = opts.execFileImpl ?? execFileAsync;
   const sleepMs = opts.sleepMs ?? defaultSleep;
-  const platform = opts.platform ?? process.platform;
   const browser = input.browser ?? "chrome";
   const prompt = input.prompt?.trim();
   const pastePrompt = Boolean(input.pastePrompt || input.submitPrompt);
@@ -89,7 +77,7 @@ export async function prepareChatGptImagesApp(
     throw new DomainError(ErrorCode.INVALID_IMAGE_DATA, "pastePrompt requires a non-empty prompt.");
   }
 
-  await openImagesApp(execFileImpl, browser, platform);
+  await openImagesApp(execFileImpl, browser);
   await sleepMs(200);
 
   const next = submitPrompt

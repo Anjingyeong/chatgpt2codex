@@ -17,6 +17,24 @@ afterEach(async () => {
 });
 
 describe("applyPatch", () => {
+  it("rejects an Add File patch whose path resolves to the project root itself (would otherwise write into the parent directory)", async () => {
+    // Before the rejectRoot guard: rel="." resolves to realRoot unchanged,
+    // so the commit loop's `dir = path.dirname(abs)` is the project's
+    // PARENT directory, and a temp file gets written there (then the final
+    // rename fails with EISDIR, but the temp file is never rolled back
+    // because it was never pushed to `committed`) — a confinement escape
+    // that leaks attacker content into the parent directory.
+    for (const rootLikePath of [".", ""]) {
+      const patch = ["*** Begin Patch", `*** Add File: ${rootLikePath || "."}`, "+pwned-into-parent-dir", "*** End Patch"].join("\n");
+      await expect(applyPatch(root, patch)).rejects.toMatchObject({ code: ErrorCode.PATH_OUTSIDE_PROJECT });
+    }
+
+    // Confirm nothing was actually written into the project's parent
+    // directory (the temp-file naming pattern the commit loop uses).
+    const parentEntries = await fs.readdir(path.dirname(root));
+    expect(parentEntries.some((name) => name.startsWith(".chatgpt2codex.tmp."))).toBe(false);
+  });
+
   it("applies an Add File operation, creating the new file", async () => {
     const patch = [
       "*** Begin Patch",
@@ -154,6 +172,18 @@ describe("applyPatch", () => {
 });
 
 describe("createFile", () => {
+  it("rejects a root-equivalent rel path with overwrite=true instead of writing into the parent directory", async () => {
+    // With overwrite=false the pre-existing fileExists(realRoot)=true check
+    // already blocks this (FILE_EXISTS), but overwrite=true skips that
+    // check entirely and would otherwise resolve straight to realRoot.
+    await expect(createFile(root, ".", "pwned-into-parent-dir", true)).rejects.toMatchObject({
+      code: ErrorCode.PATH_OUTSIDE_PROJECT,
+    });
+    await expect(createFile(root, "", "pwned-into-parent-dir", true)).rejects.toMatchObject({
+      code: ErrorCode.PATH_OUTSIDE_PROJECT,
+    });
+  });
+
   it("creates a new file and returns its byte size", async () => {
     const result = await createFile(root, "made.txt", "hello");
     expect(result.path).toBe("made.txt");

@@ -710,6 +710,16 @@ class LoginAttemptTracker {
   isLockedOut(key: string): boolean {
     const record = this.attempts.get(key);
     if (!record) return false;
+    // lockedUntilMs === 0 means "under the backoff threshold, not yet
+    // locked" (see recordFailure) — that is NOT the same as "was locked and
+    // the lockout has since expired". Treating the two the same here used
+    // to delete (reset to zero) the in-progress failure count on every
+    // subsequent request's own pre-check, before that request's own
+    // recordFailure call ever got a chance to increment on top of it — so
+    // `count` could never actually climb past 1 across separate requests
+    // and the exponential-backoff lockout could never engage at all. Only
+    // clear the record once an *actual* lockout period has elapsed.
+    if (record.lockedUntilMs === 0) return false;
     if (record.lockedUntilMs <= Date.now()) {
       this.attempts.delete(key);
       return false;
@@ -766,6 +776,12 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const clientIp = res.req.ip ?? res.req.socket.remoteAddress ?? "unknown";
+    // The lockout key must not be forgeable by a local client sitting directly
+    // on the loopback TCP peer (trust proxy is "loopback", so such a client's
+    // X-Forwarded-For is trusted and would otherwise let it rotate req.ip on
+    // every request). Key the brute-force lockout on the raw socket peer;
+    // keep req.ip only for the audited/display value.
+    const lockoutKey = res.req.socket.remoteAddress ?? clientIp;
     const locale = localeFromRequest(res);
 
     if (res.req.method !== "POST") {
@@ -806,7 +822,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       return;
     }
 
-    if (this.loginAttempts.isLockedOut(clientIp)) {
+    if (this.loginAttempts.isLockedOut(lockoutKey)) {
       await this.recordOwnerTokenAttempt("locked_out", clientIp, client);
       res.status(429).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
@@ -825,6 +841,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
 
     const ownerTokenAccepted = providedToken.length > 0 && (await this.config.verifyOwnerToken(providedToken));
     if (!csrfAccepted && !ownerTokenAccepted) {
+      // At this point guard 1 above already excluded the "no token submitted"
+      // case, so reaching here means a real (wrong) owner_token was submitted
+      // alongside a missing/stale csrf_token. That is a genuine failed login
+      // attempt and must be counted toward SR-05 lockout and audited, or an
+      // attacker can bypass both by simply omitting csrf_token.
+      this.loginAttempts.recordFailure(lockoutKey);
+      await this.recordOwnerTokenAttempt("failure", clientIp, client);
       res.status(403).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -841,7 +864,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     if (!ownerTokenAccepted) {
-      this.loginAttempts.recordFailure(clientIp);
+      this.loginAttempts.recordFailure(lockoutKey);
       await this.recordOwnerTokenAttempt("failure", clientIp, client);
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
@@ -858,7 +881,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       return;
     }
 
-    this.loginAttempts.recordSuccess(clientIp);
+    this.loginAttempts.recordSuccess(lockoutKey);
 
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {

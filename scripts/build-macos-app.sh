@@ -141,6 +141,18 @@ swiftc -O \
   "$ROOT/macos/ChatGPTToCodexStatusBar/main.swift" \
   -o "$MACOS_DIR/ChatGPTToCodexStatusBar"
 
+# Native AX semantic-targeting helper for Option B desktop control (see
+# src/control/mac-input.ts resolveHelperPath). Lives next to the status-bar
+# binary so it inherits the same code signature and Accessibility TCC grant
+# (both are covered by the single `codesign --deep` below).
+swiftc -O \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -framework CoreGraphics \
+  -framework Foundation \
+  "$ROOT/macos/ChatGPTToCodexStatusBar/ax-helper.swift" \
+  -o "$MACOS_DIR/chatgpt2codex-ax"
+
 cp "$BUILD_DIR/generated-icons/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 cp "$BUILD_DIR/generated-icons/StatusIconTemplate.png" "$RESOURCES_DIR/StatusIconTemplate.png"
 cp "$ROOT/assets/chatgpt2codex-icon.png" "$RESOURCES_DIR/chatgpt2codex-icon.png"
@@ -166,7 +178,7 @@ find "$RUNTIME_DIR/node_modules" -name '*.map' -type f -delete
 find "$RUNTIME_DIR/node_modules" -name '*.ts' ! -name '*.d.ts' -type f -delete
 find "$APP_DIR" -name '._*' -type f -delete
 
-chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$RUNTIME_DIR/start-chatgpt.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh"
+chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$MACOS_DIR/chatgpt2codex-ax" "$RUNTIME_DIR/start-chatgpt.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh"
 write_pkg_scripts
 xattr -cr "$APP_DIR" || true
 

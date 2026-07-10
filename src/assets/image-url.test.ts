@@ -1,6 +1,7 @@
+import { createServer } from "node:http";
 import { describe, expect, it } from "vitest";
 import { DomainError, ErrorCode } from "../types.js";
-import { fetchImageFromUrl, isBlockedAddress, type FetchLike } from "./image-url.js";
+import { defaultFetchImpl, fetchImageFromUrl, isBlockedAddress, type FetchLike, type PinnedAddress } from "./image-url.js";
 
 const PNG_1X1 = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -62,8 +63,32 @@ describe("isBlockedAddress", () => {
     expect(isBlockedAddress("fc00::1")).toBe(true);
   });
 
+  it("blocks CGNAT (RFC 6598, e.g. Alibaba Cloud metadata 100.100.100.200)", () => {
+    expect(isBlockedAddress("100.64.0.1")).toBe(true);
+    expect(isBlockedAddress("100.100.100.200")).toBe(true);
+    expect(isBlockedAddress("100.127.255.254")).toBe(true);
+  });
+
+  it("blocks 6to4 anycast relay (192.88.99.0/24)", () => {
+    expect(isBlockedAddress("192.88.99.1")).toBe(true);
+  });
+
+  it("blocks hex-group IPv4-mapped IPv6 addresses (::ffff:0:0/96), not just dotted form", () => {
+    expect(isBlockedAddress("::ffff:7f00:1")).toBe(true); // ::ffff:127.0.0.1
+    expect(isBlockedAddress("::ffff:a9fe:a9fe")).toBe(true); // ::ffff:169.254.169.254
+  });
+
+  it("blocks IPv6 transition/tunneling ranges (NAT64, 6to4, Teredo)", () => {
+    expect(isBlockedAddress("64:ff9b::a9fe:a9fe")).toBe(true); // NAT64, 64:ff9b::/96
+    expect(isBlockedAddress("2002::1")).toBe(true); // 6to4, 2002::/16
+    expect(isBlockedAddress("2001::1")).toBe(true); // Teredo, 2001::/32
+    expect(isBlockedAddress("2001:0:4136:e378:8000:63bf:3fff:fdd2")).toBe(true); // Teredo
+  });
+
   it("allows a normal public address", () => {
     expect(isBlockedAddress("93.184.216.34")).toBe(false);
+    expect(isBlockedAddress("8.8.8.8")).toBe(false);
+    expect(isBlockedAddress("2606:4700::1")).toBe(false);
   });
 });
 
@@ -278,5 +303,187 @@ describe("fetchImageFromUrl — SSRF hardening", () => {
     await expect(
       fetchImageFromUrl("https://does-not-resolve.invalid/x.png", { fetchImpl: fetchShouldNotBeCalled, lookupImpl }),
     ).rejects.toBeInstanceOf(DomainError);
+  });
+});
+
+describe("fetchImageFromUrl — DNS rebinding (TOCTOU) regression", () => {
+  const PUBLIC_ADDRESS: PinnedAddress = { address: "93.184.216.34", family: 4 };
+  const PRIVATE_ADDRESS: PinnedAddress = { address: "10.0.0.1", family: 4 };
+  const METADATA_ADDRESS: PinnedAddress = { address: "169.254.169.254", family: 4 };
+
+  /** Simulates an attacker-controlled authoritative DNS server: the
+   * validation-time lookup (T0, used by assertHostAllowed) answers with a
+   * public address, but a second, independent "connect-time resolver" would
+   * answer with a private/metadata address if anything actually asked it
+   * again. Before the fix, the real connection (fetchImpl -> global fetch)
+   * re-resolved the hostname itself and would have received this rebound
+   * answer; the fetchImpl stub below asserts that never happens. */
+  function makeRebindingLookup() {
+    let connectTimeResolverCalls = 0;
+    return {
+      // T0: what assertHostAllowed sees.
+      validationLookup: async (hostname: string) => {
+        if (hostname !== "rebind.attacker.example") throw new Error(`unexpected host ${hostname}`);
+        return [PUBLIC_ADDRESS];
+      },
+      // T1: what a naive re-resolving connection would see if it ever
+      // resolved the hostname again. Must never be invoked by fetchImpl.
+      connectTimeResolve: () => {
+        connectTimeResolverCalls++;
+        return METADATA_ADDRESS;
+      },
+      getConnectTimeResolverCalls: () => connectTimeResolverCalls,
+    };
+  }
+
+  it("connects using only the validated (T0) address, never re-resolving the hostname at connect time", async () => {
+    const rebinding = makeRebindingLookup();
+    let receivedPinnedAddresses: PinnedAddress[] | undefined;
+
+    const fetchImpl: FetchLike = async (_url, init) => {
+      receivedPinnedAddresses = init?.pinnedAddresses;
+      // A vulnerable implementation would re-resolve the hostname here
+      // (e.g. by handing the URL string to global fetch/undici). Simulate
+      // that temptation explicitly and prove it's never exercised: the
+      // fix must supply pinnedAddresses so this stub has no need to call
+      // the rebinding resolver at all.
+      if (!init?.pinnedAddresses || init.pinnedAddresses.length === 0) {
+        rebinding.connectTimeResolve(); // would happen in the vulnerable path
+      }
+      return makeResponse(200, PNG_1X1, { "content-type": "image/png" });
+    };
+
+    const result = await fetchImageFromUrl("https://rebind.attacker.example/x.png", {
+      fetchImpl,
+      lookupImpl: rebinding.validationLookup,
+    });
+
+    expect(result.mime).toBe("image/png");
+    // Connection must be pinned to exactly the T0-validated public address —
+    // never to the rebound private/metadata address.
+    expect(receivedPinnedAddresses).toEqual([PUBLIC_ADDRESS]);
+    expect(receivedPinnedAddresses).not.toContainEqual(METADATA_ADDRESS);
+    // The rebinding ("connect-time") resolver must never have been called.
+    expect(rebinding.getConnectTimeResolverCalls()).toBe(0);
+  });
+
+  it("blocks outright when the validation-time (T0) lookup itself resolves to a private address", async () => {
+    const lookupImpl = stubLookup({ "evil.rebind.example": [PRIVATE_ADDRESS] });
+    const fetchShouldNotBeCalled: FetchLike = async () => {
+      throw new Error("fetch should not have been called");
+    };
+
+    await expect(
+      fetchImageFromUrl("https://evil.rebind.example/x.png", { fetchImpl: fetchShouldNotBeCalled, lookupImpl }),
+    ).rejects.toMatchObject({ code: ErrorCode.PERMISSION_DENIED });
+  });
+
+  it("re-pins to the redirect hop's own validated address, not the original hop's address", async () => {
+    const lookupImpl = stubLookup({
+      "example.com": [PUBLIC_ADDRESS],
+      "cdn.example.com": [{ address: "93.184.216.99", family: 4 }],
+    });
+    const pinnedPerCall: Array<PinnedAddress[] | undefined> = [];
+    let call = 0;
+    const fetchImpl: FetchLike = async (_url, init) => {
+      call++;
+      pinnedPerCall.push(init?.pinnedAddresses);
+      if (call === 1) return makeRedirect(302, "https://cdn.example.com/cat.png");
+      return makeResponse(200, PNG_1X1, { "content-type": "image/png" });
+    };
+
+    const result = await fetchImageFromUrl("https://example.com/redirect", { fetchImpl, lookupImpl });
+
+    expect(result.mime).toBe("image/png");
+    expect(pinnedPerCall).toEqual([[PUBLIC_ADDRESS], [{ address: "93.184.216.99", family: 4 }]]);
+  });
+
+  it("rejects a redirect hop whose validation-time lookup resolves to a private address (redirect-based rebinding)", async () => {
+    const lookupImpl = stubLookup({
+      "example.com": [PUBLIC_ADDRESS],
+      "internal.evil.example": [PRIVATE_ADDRESS],
+    });
+    const fetchImpl: FetchLike = async () => makeRedirect(302, "http://internal.evil.example/x");
+
+    await expect(
+      fetchImageFromUrl("https://example.com/redirect-rebind", { fetchImpl, lookupImpl }),
+    ).rejects.toMatchObject({ code: ErrorCode.PERMISSION_DENIED });
+  });
+
+  it("pins both address families when the validated host resolves to IPv6 and IPv4 (happy-eyeballs)", async () => {
+    const ipv6: PinnedAddress = { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 };
+    const lookupImpl = stubLookup({ "dual-stack.example": [ipv6, PUBLIC_ADDRESS] });
+    let receivedPinnedAddresses: PinnedAddress[] | undefined;
+    const fetchImpl: FetchLike = async (_url, init) => {
+      receivedPinnedAddresses = init?.pinnedAddresses;
+      return makeResponse(200, PNG_1X1, { "content-type": "image/png" });
+    };
+
+    const result = await fetchImageFromUrl("https://dual-stack.example/x.png", { fetchImpl, lookupImpl });
+
+    expect(result.mime).toBe("image/png");
+    expect(receivedPinnedAddresses).toEqual([ipv6, PUBLIC_ADDRESS]);
+  });
+
+  it("pin invariant: addresses passed to fetchImpl are always a subset of what the validation lookup returned", async () => {
+    const validatedAddresses = [
+      { address: "203.0.113.9", family: 4 },
+      { address: "203.0.113.10", family: 4 },
+    ];
+    // Note: these are TEST-NET-3 addresses, blocked by this module's own
+    // range checks — swap in genuinely public addresses if this invariant
+    // check is ever extended to assert a successful fetch too. Here we only
+    // care that whatever set assertHostAllowed validates is exactly what
+    // gets pinned, using a host that DOES resolve to allowed addresses.
+    const allowedAddresses = [
+      { address: "93.184.216.34", family: 4 },
+      { address: "93.184.216.35", family: 4 },
+    ];
+    void validatedAddresses;
+    const lookupImpl = stubLookup({ "multi-a.example": allowedAddresses });
+    let receivedPinnedAddresses: PinnedAddress[] | undefined;
+    const fetchImpl: FetchLike = async (_url, init) => {
+      receivedPinnedAddresses = init?.pinnedAddresses;
+      return makeResponse(200, PNG_1X1, { "content-type": "image/png" });
+    };
+
+    await fetchImageFromUrl("https://multi-a.example/x.png", { fetchImpl, lookupImpl });
+
+    expect(receivedPinnedAddresses).toBeDefined();
+    for (const pinned of receivedPinnedAddresses ?? []) {
+      expect(allowedAddresses).toContainEqual(pinned);
+    }
+  });
+
+  it("defaultFetchImpl connects to the pinned IP while preserving the original Host header (CDN/SNI compatibility)", async () => {
+    let receivedHost: string | undefined;
+    const server = createServer((req, res) => {
+      receivedHost = req.headers.host;
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("expected AddressInfo");
+    const port = address.port;
+
+    try {
+      // The URL's hostname is a fake public-looking name; it never gets
+      // resolved for real. The pinned address is the loopback address the
+      // local test server is actually listening on. If the fix regressed
+      // and defaultFetchImpl re-resolved the hostname instead of honoring
+      // the pin, this request would fail (fake host doesn't resolve) rather
+      // than reaching the local server.
+      const res = await defaultFetchImpl(`http://cdn.example.com:${port}/`, {
+        pinnedAddresses: [{ address: "127.0.0.1", family: 4 }],
+      });
+      expect(res.status).toBe(200);
+      // Host header must reflect the original hostname, not the pinned IP —
+      // this is what keeps virtual-hosted CDNs / SNI routing / cert
+      // validation working.
+      expect(receivedHost).toBe(`cdn.example.com:${port}`);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

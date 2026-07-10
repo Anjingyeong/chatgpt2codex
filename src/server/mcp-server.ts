@@ -9,7 +9,7 @@ import { registerTools } from "./tools.js";
 export async function createServer(ctx: ToolContext): Promise<McpServer> {
   const server = new McpServer({
     name: "chatgpt2codex",
-    version: "0.1.2",
+    version: "0.1.1",
   });
 
   registerTools(server, ctx);

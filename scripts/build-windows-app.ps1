@@ -123,11 +123,7 @@ Assert-UnderPath $OutputDir $BuildRoot
 
 $Npm = Get-ToolPath @("npm.cmd")
 Write-Host "[chatgpt2codex] installing dependencies..."
-if (Test-Path -LiteralPath (Join-Path $Root "package-lock.json")) {
-  Invoke-Checked $Npm @("ci")
-} else {
-  Invoke-Checked $Npm @("install")
-}
+Invoke-Checked $Npm @("install")
 Write-Host "[chatgpt2codex] building TypeScript..."
 Invoke-Checked $Npm @("run", "build")
 

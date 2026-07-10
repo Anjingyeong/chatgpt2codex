@@ -36,8 +36,14 @@ export interface Project {
  */
 export type ProjectRegistryEntry = Project;
 
-/** Lease preset controlling the ceiling of permitted mutating operations. */
-export type LeasePreset = "read-only" | "tests-only" | "full-write" | "image-only";
+/**
+ * Lease preset controlling the ceiling of permitted mutating operations.
+ * `control` is the Option B human-confirmed desktop-control preset: it grants
+ * only `read` + `control` capabilities (never write/image/remote) and is
+ * only reachable when the install-time `CHATGPT2CODEX_CONTROL` feature flag
+ * is enabled (src/control/policy.ts isControlEnabled).
+ */
+export type LeasePreset = "read-only" | "tests-only" | "full-write" | "image-only" | "control";
 
 /** Active project lease granted by `project_select`. */
 export interface Lease {
@@ -92,6 +98,15 @@ export interface ToolContext {
     setSession(s: unknown): Promise<void>;
   };
   config: Config;
+  /** True for an MCP server instance handed a remote/network transport
+   * session (currently: src/server/http.ts's /mcp endpoint, which is how
+   * ChatGPT connects). Absent/false for local stdio sessions (Codex CLI,
+   * status bar). Used to refuse arming a `control` lease or resuming a
+   * killed control session (project_select preset=control) from a remote
+   * caller — lease arming and kill resumption stay local-only even when the
+   * desktop-control tools are exposed to ChatGPT
+   * (src/control/policy.ts isControlChatGptExposed). */
+  remote?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +144,11 @@ export enum ErrorCode {
   UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE",
   QUOTA_EXCEEDED = "QUOTA_EXCEEDED",
   PERMISSION_DENIED = "PERMISSION_DENIED",
+  // Option B desktop-control codes (src/control/**).
+  CONTROL_DISABLED = "CONTROL_DISABLED",
+  CONFIRMATION_PENDING = "CONFIRMATION_PENDING",
+  SENSITIVE_TARGET_BLOCKED = "SENSITIVE_TARGET_BLOCKED",
+  CONTROL_KILLED = "CONTROL_KILLED",
 }
 
 /** Thrown by any domain-level failure. Tool boundary must catch and map. */

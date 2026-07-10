@@ -232,7 +232,7 @@ describe("Custom GPT action bridge", () => {
     expect(body.openapi).toBe("3.1.0");
     expect(body.info.version).toBe("0.1.6");
     expect(body.info.description).toContain("source editing");
-    expect(body.info.description).toContain("cannot write local filesystem paths directly");
+    expect(body.info.description).toContain("cannot write /Users/");
     expect(body.info.description).toContain("30 operations");
     expect(body.info.description).toContain("workspace_list_projects");
     expect(body.info.description).toContain("save_chatgpt_image/save_chatgpt_image_from_url");
@@ -692,6 +692,192 @@ describe("Custom GPT action bridge", () => {
     });
     expect(proxied.structuredContent.path).toBe("proxy-action.txt");
     await expect(fs.readFile(path.join(projectRoot, "proxy-action.txt"), "utf8")).resolves.toBe("written by call-tool\n");
+  });
+
+  it("rejects preset=control through the action bridge (non-blocking gap #2) on both call-tool and the project-select route", async () => {
+    const ctx = makeCtx(stateDir, projectRoot);
+    const server = await startApp(ctx);
+    stop = server.stop;
+
+    const bridgeRes = await postAction(server.baseUrl, "/actions/call-tool", {
+      toolName: "project_select",
+      input: { projectId: "proj", reason: "remote attempt", preset: "control" },
+    });
+    const bridgeBody = (await bridgeRes.json()) as { ok: boolean; structuredContent: { code?: string } };
+    expect(bridgeRes.status).toBe(200);
+    expect(bridgeBody.ok).toBe(false);
+    expect(bridgeBody.structuredContent.code).toBe("PERMISSION_DENIED");
+
+    const routeRes = await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "remote attempt via route",
+      preset: "control",
+    });
+    const routeBody = (await routeRes.json()) as { ok: boolean; structuredContent: { code?: string } };
+    expect(routeRes.status).toBe(200);
+    expect(routeBody.ok).toBe(false);
+    expect(routeBody.structuredContent.code).toBe("PERMISSION_DENIED");
+
+    // Neither attempt actually granted a control lease / cleared a kill.
+    const session = (await ctx.store.getSession()) as { lease?: { preset?: string } | null } | null;
+    expect(session?.lease?.preset ?? null).not.toBe("control");
+
+    // Omitting preset (defaults to full-write) and explicitly requesting
+    // full-write must both keep working through the same bridge.
+    const defaultedRes = await postAction(server.baseUrl, "/actions/call-tool", {
+      toolName: "project_select",
+      input: { projectId: "proj", reason: "default preset" },
+    });
+    const defaulted = (await defaultedRes.json()) as { ok: boolean; structuredContent: { lease?: Lease } };
+    expect(defaulted.ok).toBe(true);
+    expect(defaulted.structuredContent.lease?.preset).toBe("full-write");
+
+    const explicitFullWriteRes = await postAction(server.baseUrl, "/actions/call-tool", {
+      toolName: "project_select",
+      input: { projectId: "proj", reason: "explicit full-write", preset: "full-write" },
+    });
+    const explicitFullWrite = (await explicitFullWriteRes.json()) as { ok: boolean; structuredContent: { lease?: Lease } };
+    expect(explicitFullWrite.ok).toBe(true);
+    expect(explicitFullWrite.structuredContent.lease?.preset).toBe("full-write");
+  });
+
+  it("re-validates the registered tool's zod inputSchema on the generic call-tool bridge (bypasses the MCP SDK's normal validation otherwise)", async () => {
+    // callRegisteredTool fetches the raw registered handler directly,
+    // bypassing the MCP SDK's tools/call path where zod inputSchema (ranges,
+    // enums, refine, min/max) is normally enforced. Without re-validating,
+    // an out-of-schema numeric value — here e2e_open_url_screenshot's
+    // waitMs: z.number().int().min(0).max(30_000) — would reach the tool
+    // handler unchecked. This exercises the exact bridge/callRegisteredTool
+    // codepath (not the tool's own internal logic), so no project lease or
+    // real local URL needs to succeed for this assertion: rejection must
+    // happen before the handler ever runs.
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/call-tool", {
+      toolName: "e2e_open_url_screenshot",
+      input: {
+        projectId: "proj",
+        url: "http://127.0.0.1:1/",
+        waitMs: 999_999, // exceeds max(30_000)
+      },
+    });
+    const body = (await res.json()) as { ok: boolean; structuredContent?: { code?: string; error?: string } };
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(false);
+    expect(body.structuredContent?.code).toBe("INVALID_INPUT");
+    expect(body.structuredContent?.error ?? "").toContain("waitMs");
+  });
+
+  it("re-validates zod inputSchema on the per-route action bridge too (not just /actions/call-tool)", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const res = await postAction(server.baseUrl, "/actions/e2e-open-url-screenshot", {
+      projectId: "proj",
+      url: "http://127.0.0.1:1/",
+      waitMs: 999_999,
+    });
+    const body = (await res.json()) as { ok: boolean; structuredContent?: { code?: string } };
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(false);
+    expect(body.structuredContent?.code).toBe("INVALID_INPUT");
+  });
+
+  describe("owner-token brute-force lockout (SR-05) cannot be bypassed by omitting csrf_token", () => {
+    it("counts a wrong owner_token toward the lockout even when csrf_token is omitted entirely", async () => {
+      // Before the fix: with csrf_token omitted and owner_token wrong, the
+      // handler took the (!csrfAccepted && !ownerTokenAccepted) branch and
+      // returned 403 WITHOUT ever calling loginAttempts.recordFailure — so
+      // this exact request shape could be repeated forever with no lockout
+      // and no audit trail. After the fix, a *submitted* (not merely
+      // omitted) wrong token is always accounted for. Prove it by tripping
+      // the lockout purely with csrf-omitted wrong-token attempts, then
+      // showing even the *correct* token is refused (429) once locked out.
+      const server = await startApp(makeCtx(stateDir, projectRoot));
+      stop = server.stop;
+      const client = await registerOAuthClient(server.baseUrl);
+      const url = authorizeUrl(server.baseUrl, client.clientId, client.redirectUri);
+
+      const MAX_ATTEMPTS_BEFORE_BACKOFF = 5;
+      for (let i = 0; i < MAX_ATTEMPTS_BEFORE_BACKOFF; i++) {
+        const body = new URLSearchParams(url.searchParams);
+        // csrf_token intentionally omitted.
+        body.set("owner_token", `wrong-owner-token-${i}`);
+
+        const res = await fetch(`${server.baseUrl}/authorize`, {
+          method: "POST",
+          headers: { origin: "https://chatgpt.com", "content-type": "application/x-www-form-urlencoded" },
+          body: body.toString(),
+          redirect: "manual",
+        });
+        // Not yet locked out — each of these is a plain rejected attempt.
+        expect(res.status).toBe(403);
+      }
+
+      const finalBody = new URLSearchParams(url.searchParams);
+      finalBody.set("csrf_token", "irrelevant-because-locked-out");
+      finalBody.set("owner_token", OWNER_TOKEN); // the genuinely correct token
+      const finalRes = await fetch(`${server.baseUrl}/authorize`, {
+        method: "POST",
+        headers: { origin: "https://chatgpt.com", "content-type": "application/x-www-form-urlencoded" },
+        body: finalBody.toString(),
+        redirect: "manual",
+      });
+
+      // If the csrf-omitted wrong-token attempts above had been silently
+      // swallowed (the pre-fix bypass), the lockout counter would still be
+      // at 0 and this correct-token request would succeed (302). Getting
+      // 429 here proves those attempts were counted.
+      expect(finalRes.status).toBe(429);
+    });
+  });
+
+  describe("CHATGPT2CODEX_CONTROL_CHATGPT exposure on the generic action bridge", () => {
+    afterEach(() => {
+      delete process.env.CHATGPT2CODEX_CONTROL_CHATGPT;
+    });
+
+    it("still blocks control tools on /actions/call-tool by default (flag unset)", async () => {
+      const server = await startApp(makeCtx(stateDir, projectRoot));
+      stop = server.stop;
+
+      const res = await postAction(server.baseUrl, "/actions/call-tool", {
+        toolName: "computer_action_status",
+        input: {},
+      });
+      const body = (await res.json()) as { ok: boolean; structuredContent?: { code?: string } };
+      expect(body.ok).toBe(false);
+      expect(body.structuredContent?.code).toBe("PERMISSION_DENIED");
+    });
+
+    it("allows control tools on /actions/call-tool once CHATGPT2CODEX_CONTROL_CHATGPT=1, but still rejects preset=control on project_select", async () => {
+      process.env.CHATGPT2CODEX_CONTROL_CHATGPT = "1";
+      const server = await startApp(makeCtx(stateDir, projectRoot));
+      stop = server.stop;
+
+      // A real control lease isn't granted through this bridge (preset=control
+      // stays blocked below), so this reaches the tool handler and fails on
+      // the lease check itself — proof it's no longer blocked by
+      // CONTROL_TOOL_NAMES specifically.
+      const res = await postAction(server.baseUrl, "/actions/call-tool", {
+        toolName: "computer_action_status",
+        input: {},
+      });
+      const body = (await res.json()) as { ok: boolean; structuredContent?: { code?: string } };
+      expect(body.ok).toBe(false);
+      expect(body.structuredContent?.code).toBe("PROJECT_NOT_SELECTED");
+
+      const bridgeRes = await postAction(server.baseUrl, "/actions/call-tool", {
+        toolName: "project_select",
+        input: { projectId: "proj", reason: "remote attempt while exposed", preset: "control" },
+      });
+      const bridgeBody = (await bridgeRes.json()) as { ok: boolean; structuredContent: { code?: string } };
+      expect(bridgeBody.ok).toBe(false);
+      expect(bridgeBody.structuredContent.code).toBe("PERMISSION_DENIED");
+    });
   });
 
   it("acknowledges broad goals quickly with next action guidance", async () => {
