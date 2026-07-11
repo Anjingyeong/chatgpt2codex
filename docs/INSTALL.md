@@ -1,11 +1,11 @@
 # ChatGPT To Codex Installation Guide
 
-Current release: [v0.1.2](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2)
+Current release: [v0.2.0](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0)
 
 Download:
 
-- macOS: `chatgpt2codex-0.1.2.pkg`
-- Windows: `chatgpt2codex-0.1.2-windows-setup.exe`
+- macOS: `chatgpt2codex-0.2.0.pkg`
+- Windows: `chatgpt2codex-0.2.0-windows-setup.exe`
 
 Only download installers from the official GitHub release page. Keep the Owner
 Token private; treat it like a password.
@@ -22,7 +22,7 @@ ChatGPT To Codex는 내 Mac 또는 Windows PC에서 실행되는 로컬 코딩 �
 
 ### macOS 설치
 
-1. 릴리스 페이지에서 `chatgpt2codex-0.1.2.pkg`를 다운로드합니다.
+1. 릴리스 페이지에서 `chatgpt2codex-0.2.0.pkg`를 다운로드합니다.
 2. Finder에서 `.pkg` 파일을 엽니다.
 3. macOS가 "확인할 수 없는 개발자" 또는 "악성 소프트웨어를 확인할 수 없음"이라고 막으면:
    - 파일을 Control-클릭 또는 오른쪽 클릭합니다.
@@ -33,7 +33,7 @@ ChatGPT To Codex는 내 Mac 또는 Windows PC에서 실행되는 로컬 코딩 �
 
 ### Windows 설치
 
-1. 릴리스 페이지에서 `chatgpt2codex-0.1.2-windows-setup.exe`를 다운로드합니다.
+1. 릴리스 페이지에서 `chatgpt2codex-0.2.0-windows-setup.exe`를 다운로드합니다.
 2. 파일을 더블클릭합니다.
 3. Windows SmartScreen이 경고하면 **추가 정보** -> **실행**을 누릅니다. 단, 반드시 이 GitHub 릴리스에서 받은 파일일 때만 진행하세요.
 4. 설치가 끝나면 **ChatGPT To Codex**를 실행합니다.
@@ -89,7 +89,7 @@ PKG is better for this release. A DMG is great for drag-and-drop apps, but this 
 
 ### Install on macOS
 
-1. Download `chatgpt2codex-0.1.2.pkg` from the release page.
+1. Download `chatgpt2codex-0.2.0.pkg` from the release page.
 2. Open the package in Finder.
 3. If macOS blocks it because it is unsigned, Control-click the file, choose **Open**, then confirm. If needed, open **System Settings** -> **Privacy & Security** -> **Open Anyway**.
 4. Open **ChatGPT To Codex** from **Applications**.
@@ -97,7 +97,7 @@ PKG is better for this release. A DMG is great for drag-and-drop apps, but this 
 
 ### Install on Windows
 
-1. Download `chatgpt2codex-0.1.2-windows-setup.exe` from the release page.
+1. Download `chatgpt2codex-0.2.0-windows-setup.exe` from the release page.
 2. Double-click the installer.
 3. If Windows SmartScreen appears, choose **More info** -> **Run anyway** only if the file came from this GitHub release.
 4. Open **ChatGPT To Codex**.
@@ -144,7 +144,7 @@ ChatGPT To Codex は、Mac または Windows PC 上で動くローカル開発�
 
 ### macOS インストール
 
-1. リリースページから `chatgpt2codex-0.1.2.pkg` をダウンロードします。
+1. リリースページから `chatgpt2codex-0.2.0.pkg` をダウンロードします。
 2. Finder で `.pkg` を開きます。
 3. macOS にブロックされた場合は、ファイルを Control-クリックして **Open** を選びます。必要なら **System Settings** -> **Privacy & Security** -> **Open Anyway** を選びます。
 4. **Applications** から **ChatGPT To Codex** を起動します。
@@ -152,7 +152,7 @@ ChatGPT To Codex は、Mac または Windows PC 上で動くローカル開発�
 
 ### Windows インストール
 
-1. リリースページから `chatgpt2codex-0.1.2-windows-setup.exe` をダウンロードします。
+1. リリースページから `chatgpt2codex-0.2.0-windows-setup.exe` をダウンロードします。
 2. インストーラをダブルクリックします。
 3. Windows SmartScreen が表示された場合は、公式 GitHub リリースから取得したファイルであることを確認してから **More info** -> **Run anyway** を選びます。
 4. **ChatGPT To Codex** を起動します。
@@ -194,7 +194,7 @@ ChatGPT To Codex 是一个在 Mac 或 Windows PC 本机运行的开发连接应�
 
 ### macOS 安装
 
-1. 从发布页面下载 `chatgpt2codex-0.1.2.pkg`。
+1. 从发布页面下载 `chatgpt2codex-0.2.0.pkg`。
 2. 在 Finder 中打开 `.pkg` 文件。
 3. 如果 macOS 因未签名而阻止安装，请 Control-点击文件，选择 **Open**。必要时到 **System Settings** -> **Privacy & Security** -> **Open Anyway**。
 4. 从 **Applications** 打开 **ChatGPT To Codex**。
@@ -202,7 +202,7 @@ ChatGPT To Codex 是一个在 Mac 或 Windows PC 本机运行的开发连接应�
 
 ### Windows 安装
 
-1. 从发布页面下载 `chatgpt2codex-0.1.2-windows-setup.exe`。
+1. 从发布页面下载 `chatgpt2codex-0.2.0-windows-setup.exe`。
 2. 双击安装程序。
 3. 如果 Windows SmartScreen 出现警告，请确认文件来自官方 GitHub Release，然后选择 **More info** -> **Run anyway**。
 4. 打开 **ChatGPT To Codex**。

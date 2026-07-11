@@ -14,7 +14,7 @@ Your source stays on your machine. ChatGPT connects to the local app you run.
 You choose the workspace, approve the token, and keep control of what gets
 edited.
 
-[Download v0.1.2](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2) ·
+[Download v0.2.0](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0) ·
 [Beginner installation guide](docs/INSTALL.md)
 
 > Help us get this in front of more builders: star the repo if you want
@@ -44,8 +44,8 @@ ChatGPT thinks. Your computer acts. You review the result.
 
 | Platform | Status | Package |
 | --- | --- | --- |
-| macOS | Public release | `chatgpt2codex-0.1.2.pkg` |
-| Windows | Public release | `chatgpt2codex-0.1.2-windows-setup.exe` |
+| macOS | Public release | `chatgpt2codex-0.2.0.pkg` |
+| Windows | Public release | `chatgpt2codex-0.2.0-windows-setup.exe` |
 | Linux | Developer path only | Not published |
 
 ### Why PKG Instead Of DMG?
@@ -59,7 +59,7 @@ can still be added later for a more consumer-style download.
 Current macOS package SHA-256:
 
 ```text
-d9226ba10d9a24a121a0ec6c7a6c79f81d55b3bb60ddc5acd13240c2d17f7821  chatgpt2codex-0.1.2.pkg
+317193f796ee0bdeb09dac0164d01b4ff930372116bdc91aeb4378b56cd2df44  chatgpt2codex-0.2.0.pkg
 ```
 
 ## What ChatGPT Can Do With It
@@ -97,7 +97,7 @@ Full beginner guide: [docs/INSTALL.md](docs/INSTALL.md)
 
 macOS short version:
 
-1. Download `chatgpt2codex-0.1.2.pkg` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2).
+1. Download `chatgpt2codex-0.2.0.pkg` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0).
 2. Open the installer.
 3. If macOS blocks the unsigned package, Control-click it, choose **Open**, and
    confirm in **System Settings** -> **Privacy & Security** if needed.
@@ -112,7 +112,7 @@ macOS short version:
 
 Windows short version:
 
-1. Download `chatgpt2codex-0.1.2-windows-setup.exe` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.1.2).
+1. Download `chatgpt2codex-0.2.0-windows-setup.exe` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0).
 2. Double-click the installer.
 3. If Windows SmartScreen warns, choose **More info** -> **Run anyway** only if
    the file came from this GitHub release.
