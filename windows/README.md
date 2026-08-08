@@ -22,6 +22,23 @@ Portable/source install:
   once on Windows.
 - Fallback launcher: `windows\Start-ChatGPTToCodexTray.cmd`.
 
+Development package behavior:
+
+- When `ChatGPT To Codex.exe` is launched from this repository's
+  `build\windows\chatgpt2codex` directory, the packaged launcher detects the
+  source checkout three levels above it and delegates to the source
+  `start-chatgpt.ps1`.
+- The source launcher checks whether `src`, `package.json`, `package-lock.json`,
+  or `tsconfig.json` is newer than `dist\cli.js`. If so, it automatically runs
+  `npm run build` before starting MCP.
+- This means normal development no longer requires rebuilding the Windows exe or
+  copying `dist` after every TypeScript change. Edit source, restart MCP, and the
+  launcher rebuilds and uses the current source checkout automatically.
+- Installed or extracted release packages outside that exact development layout
+  do not delegate to a source checkout and keep using their bundled `dist`.
+- Run `npm run windows:launcher:test` to verify source-root detection, stale-build
+  detection, PowerShell parsing, and, when present, generated-launcher sync.
+
 The app uses `winget` to install Node.js LTS and `cloudflared` only when they
 are missing, then opens a tray controller. Starting MCP is loopback-only by
 default. For ChatGPT web, prefer your own stable hostname; use temporary Quick
@@ -51,6 +68,13 @@ E2E screenshot prompt:
 Use ChatGPT To Codex to run E2E, open the app, capture screenshots, and show them inline.
 ```
 
+For local web projects, Windows E2E capture launches an installed Microsoft Edge
+or Google Chrome with an isolated temporary profile and uses the local Chrome
+DevTools Protocol to save deterministic browser viewports under
+`.chatgpt2codex/e2e/screenshots`. The one-shot E2E flow captures desktop
+top/middle/bottom plus mobile (390x844) top/middle/bottom views. It does not
+require the target browser window to remain visible on screen.
+
 Troubleshooting:
 
 - If SmartScreen appears, verify the installer came from the official GitHub
@@ -59,8 +83,8 @@ Troubleshooting:
   click **Start MCP**, then copy the URL again.
 - If port 7676 is busy, use **Restart MCP** from the tray menu. The launcher
   cleans up stale runtime processes before restart.
-- If a screenshot is blank, keep the browser or app window visible on screen and
-  retry the E2E action.
+- For local web screenshots, confirm Microsoft Edge or Google Chrome is installed.
+  Desktop-app window capture still has separate platform limitations.
 - If ChatGPT asks for approval, paste the Owner Token from the Windows app.
 
 The tray UI follows the Windows display language by default and can be changed

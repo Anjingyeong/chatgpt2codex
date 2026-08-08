@@ -53,7 +53,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "goal_loop",
     summary: "Run or continue a local coding loop",
     description:
-      "Use this for Codex-style autonomous work through ChatGPT Actions when Codex quota is unavailable. It keeps the loop state local, returns the next concrete action batch quickly, and tells ChatGPT to call it again after each inspect/edit/verify batch until done or blocked.",
+      "Use this for Codex-style autonomous work through ChatGPT Actions when Codex quota is unavailable. It keeps the loop state local, can persist structured current-task/completed/pending/decision progress, returns the next concrete action batch quickly, and tells ChatGPT to call it again after each inspect/edit/verify batch until done or blocked.",
     schema: "GoalLoopInput",
   },
   {
@@ -64,6 +64,15 @@ const ACTION_ROUTES: ActionRoute[] = [
     description:
       "Selects and leases the project. GPT Actions default to preset=full-write when preset is omitted, so source edits can be applied directly through chatgpt2codex instead of returning copy/paste scripts. Use preset=image-only only for image-only saves.",
     schema: "ProjectSelectInput",
+  },
+  {
+    path: "/actions/session-resume",
+    tool: "session_resume",
+    operationId: "session_resume",
+    summary: "Resume recent local project work",
+    description:
+      "Load the active project's recent work context and validate stored file hashes before reusing it. Call this after project_select on follow-up work so unchanged artifacts can be resumed without broad rediscovery.",
+    schema: "SessionResumeInput",
   },
   {
     path: "/actions/workspace-list-projects",
@@ -201,7 +210,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_test_and_show_screenshot",
     summary: "E2E test and show screenshot inline",
     description:
-      "Call this one-shot action when the user says 'e2e 테스트하고 스크린샷 보여줘', 'run e2e and show me the screenshot', or similar. It uses the active project by default, detects web vs desktop-app projects such as Tauri, runs only discovered local package scripts, opens the built desktop app for Tauri projects, captures multiple top/middle/bottom desktop app-window screenshots for desktop apps or browser-region screenshots for web apps, and returns imageMarkdown/imageMarkdownList. If the local check fails, inspect logs, make normal code fixes with separate coding tools, rerun E2E, and only then render the final passing screenshot set inline.",
+      "Call this one-shot action when the user says 'e2e 테스트하고 스크린샷 보여줘', 'run e2e and show me the screenshot', or similar. It uses the active project by default, detects web vs desktop-app projects such as Tauri, runs only discovered local package scripts, and captures visual proof. macOS supports app-window and top/middle/bottom browser-region screenshots; Windows web projects use an installed Edge/Chrome with an isolated profile and capture desktop plus 390x844 mobile top/middle/bottom views. The action returns imageMarkdown/imageMarkdownList. If the local check fails, inspect logs, make normal code fixes with separate coding tools, rerun E2E, and only then render the final passing screenshot set inline.",
     schema: "E2eTestAndShowScreenshotInput",
   },
   {
@@ -218,7 +227,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "e2e_open_url_screenshot",
     operationId: "e2e_open_url_screenshot",
     summary: "Open a URL and capture an E2E screenshot",
-    description: "Open a URL, wait briefly, capture the browser page region, and return inline image markdown for visual E2E proof.",
+    description: "Open a local loopback URL, wait briefly, capture browser visual proof on macOS or Windows, and return inline image markdown.",
     schema: "E2eOpenUrlScreenshotInput",
   },
   {
@@ -318,6 +327,7 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "goal_intake",
   "goal_loop",
   "project_select",
+  "session_resume",
   "workspace_list_projects",
   "project_status",
   "project_rules",
@@ -649,6 +659,12 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
                 "The user's broad /goal, deep research, implementation, debugging, review, or planning request. Pass the full request text.",
             },
             projectId: { type: "string", description: "Optional known project id/name." },
+            workSessionId: {
+              type: "string",
+              pattern: "^ws_[A-Za-z0-9_.-]+$",
+              maxLength: 120,
+              description: "Optional existing local work-session handle. If omitted for a known project, goal_intake creates one.",
+            },
             mode: { type: "string", enum: ["implement", "research", "debug", "review", "plan"] },
             urgency: { type: "string", enum: ["normal", "fast"] },
           },
@@ -667,11 +683,48 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               description: "Existing local loop id returned by a previous goal_loop call.",
             },
             projectId: { type: "string", description: "Optional known project id/name." },
+            workSessionId: {
+              type: "string",
+              pattern: "^ws_[A-Za-z0-9_.-]+$",
+              maxLength: 120,
+              description: "Work-session handle returned by goal_intake/goal_loop. Reuse it for the same isolated task.",
+            },
             mode: { type: "string", enum: ["implement", "research", "debug", "review", "plan"] },
             maxTurns: { type: "integer", minimum: 1, maximum: 50, description: "Maximum ChatGPT action turns for this loop." },
             lastResult: {
               type: "string",
               description: "Short summary of the previous inspect/edit/verify batch before continuing.",
+            },
+            currentTask: {
+              type: "string",
+              maxLength: 500,
+              description: "Current concrete task within the broader goal. Replaces the prior current task when provided.",
+            },
+            completed: {
+              type: "array",
+              maxItems: 50,
+              items: { type: "string", maxLength: 500 },
+              description: "Newly completed task items. They are merged into the project's completed history.",
+            },
+            pending: {
+              type: "array",
+              maxItems: 50,
+              items: { type: "string", maxLength: 500 },
+              description: "Current pending-task snapshot. Replaces the prior pending list when provided.",
+            },
+            decisions: {
+              type: "array",
+              maxItems: 10,
+              description: "New design or implementation decisions worth preserving for later resume.",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["summary"],
+                properties: {
+                  summary: { type: "string", maxLength: 500 },
+                  rationale: { type: "string", maxLength: 1000 },
+                },
+              },
             },
           },
         },
@@ -707,12 +760,70 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId"],
           properties: { projectId: { type: "string" } },
         },
+        SessionResumeInput: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            projectId: { type: "string" },
+            workSessionId: {
+              type: "string",
+              pattern: "^ws_[A-Za-z0-9_.-]+$",
+              maxLength: 120,
+              description: "Optional isolated work-session handle. Omit to use the legacy project-default context.",
+            },
+            includeActiveSlice: {
+              type: "boolean",
+              description: "When true, fresh-read the remembered active line range and return it with the resume metadata.",
+            },
+            maxActiveSliceLines: {
+              type: "integer",
+              minimum: 1,
+              maximum: 300,
+              description: "Maximum number of active-file lines to hydrate in the resume response. Default 160.",
+            },
+            validationScope: {
+              type: "string",
+              enum: ["active", "recent"],
+              description: "Hash-validation scope. Defaults to recent for backward compatibility; active validates only the current artifact.",
+            },
+          },
+        },
         ProjectSelectInput: {
           type: "object",
           additionalProperties: false,
           required: ["projectId", "reason"],
           properties: {
             projectId: { type: "string", description: "Project id or name, for example chatgpt2codex." },
+            workSessionId: {
+              type: "string",
+              pattern: "^ws_[A-Za-z0-9_.-]+$",
+              maxLength: 120,
+              description: "Optional isolated work-session handle to select/resume within this project.",
+            },
+            resumeHint: {
+              type: "string",
+              maxLength: 1000,
+              description: "Optional follow-up hint used to conservatively rank same-project work sessions when workSessionId is unknown.",
+            },
+            includeResumeContext: {
+              type: "boolean",
+              description: "When true, include validated recent work context directly in the project-select response.",
+            },
+            includeResumeSlice: {
+              type: "boolean",
+              description: "When resume context is included, fresh-read its remembered active line range. Defaults true for a resolved work session.",
+            },
+            maxResumeSliceLines: {
+              type: "integer",
+              minimum: 1,
+              maximum: 300,
+              description: "Maximum hydrated source lines returned inside fused resume context. Default 160.",
+            },
+            resumeValidationScope: {
+              type: "string",
+              enum: ["active", "recent"],
+              description: "Hash-validation scope for fused resume. Defaults to active for the fast path; recent validates the full remembered working set.",
+            },
             reason: { type: "string" },
             preset: {
               type: "string",
@@ -739,6 +850,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "path"],
           properties: {
             projectId: { type: "string" },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             path: { type: "string" },
             start: { type: "integer", minimum: 1 },
             end: { type: "integer", minimum: 1 },
@@ -751,6 +863,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "patch"],
           properties: {
             projectId: { type: "string" },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             patch: { type: "string", description: "Codex-style *** Begin Patch envelope." },
             preconditionHashes: { type: "object", additionalProperties: { type: "string" } },
           },
@@ -761,6 +874,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "path", "content"],
           properties: {
             projectId: { type: "string" },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             path: { type: "string" },
             content: { type: "string" },
             overwrite: { type: "boolean" },
@@ -772,6 +886,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "commandId"],
           properties: {
             projectId: { type: "string" },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             commandId: { type: "string" },
             args: { type: "array", items: { type: "string" } },
             intent: {
@@ -791,6 +906,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "command"],
           properties: {
             projectId: { type: "string" },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             command: { type: "string" },
             cwd: { type: "string" },
             timeoutSec: { type: "integer", minimum: 1, maximum: 900 },
@@ -845,6 +961,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "command"],
           properties: {
             projectId: { type: "string" },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             command: { type: "string", description: "E2E/test command to run in the project, e.g. npm run test:e2e." },
             cwd: { type: "string", description: "Optional project-relative working directory." },
             timeoutSec: { type: "integer", minimum: 1, maximum: 900 },
@@ -869,6 +986,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           properties: {
             projectId: { type: "string", description: "Optional. If omitted, use the currently selected project." },
+            workSessionId: { type: "string", pattern: "^ws_[A-Za-z0-9_.-]+$", maxLength: 120 },
             instruction: {
               type: "string",
               description: "The user's natural-language request, e.g. e2e 테스트하고 스크린샷 보여줘.",
@@ -888,7 +1006,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             projectId: { type: "string" },
             label: { type: "string" },
             waitMs: { type: "integer", minimum: 0, maximum: 30000 },
-            openAfterCapture: { type: "boolean", description: "Open the screenshot on the Mac immediately after capture." },
+            openAfterCapture: { type: "boolean", description: "Open the screenshot locally immediately after capture when supported." },
           },
         },
         E2eOpenUrlScreenshotInput: {

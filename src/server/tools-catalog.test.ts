@@ -29,6 +29,33 @@ function makeCtx(): ToolContext {
 }
 
 describe("tool catalog", () => {
+  it("exposes structured semantic-progress fields on goal_loop", async () => {
+    const server = await createServer(makeCtx());
+    const tools = (
+      server as unknown as {
+        _registeredTools?: Record<string, { inputSchema?: { shape?: Record<string, unknown> } }>;
+      }
+    )._registeredTools;
+    const shape = tools?.goal_loop?.inputSchema?.shape;
+
+    expect(shape?.workSessionId).toBeDefined();
+    expect(shape?.currentTask).toBeDefined();
+    expect(shape?.completed).toBeDefined();
+    expect(shape?.pending).toBeDefined();
+    expect(shape?.decisions).toBeDefined();
+    expect(tools?.work_session_list).toBeDefined();
+    expect(tools?.session_resume?.inputSchema?.shape?.workSessionId).toBeDefined();
+    expect(tools?.session_resume?.inputSchema?.shape?.includeActiveSlice).toBeDefined();
+    expect(tools?.session_resume?.inputSchema?.shape?.maxActiveSliceLines).toBeDefined();
+    expect(tools?.session_resume?.inputSchema?.shape?.validationScope).toBeDefined();
+    expect(tools?.file_read_slice?.inputSchema?.shape?.workSessionId).toBeDefined();
+    expect(tools?.project_select?.inputSchema?.shape?.resumeHint).toBeDefined();
+    expect(tools?.project_select?.inputSchema?.shape?.includeResumeContext).toBeDefined();
+    expect(tools?.project_select?.inputSchema?.shape?.includeResumeSlice).toBeDefined();
+    expect(tools?.project_select?.inputSchema?.shape?.maxResumeSliceLines).toBeDefined();
+    expect(tools?.project_select?.inputSchema?.shape?.resumeValidationScope).toBeDefined();
+  });
+
   it("keeps the one-shot E2E tool out of destructive/open-world routing", async () => {
     const server = await createServer(makeCtx());
     const tools = (

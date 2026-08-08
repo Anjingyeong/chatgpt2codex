@@ -124,7 +124,7 @@ Use ChatGPT To Codex to run E2E, open the app, capture screenshots, and show the
 
 macOS may ask for Screen Recording and Accessibility permissions. Enable them in **System Settings** -> **Privacy & Security**.
 
-On Windows, allow the browser or app window to be visible while capturing. If a screenshot is blank, restart ChatGPT To Codex normally, keep the target window on screen, and retry.
+On Windows, local web screenshots use an installed Microsoft Edge or Google Chrome with an isolated temporary profile and the local Chrome DevTools Protocol. The one-shot web E2E flow captures desktop and 390x844 mobile top/middle/bottom views without requiring a visible browser window. Desktop-app window capture still has separate platform limitations.
 
 ### Notes
 

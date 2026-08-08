@@ -57,7 +57,11 @@ async function startApp(ctx: ToolContext): Promise<{ baseUrl: string; stop(): Pr
   };
 }
 
-function makeCtx(stateDir: string, projectRoot: string): ToolContext {
+function makeCtx(
+  stateDir: string,
+  projectRoot: string,
+  extraProjects: Array<{ projectId: string; name: string; root: string }> = [],
+): ToolContext {
   const registry = [
     {
       projectId: "proj",
@@ -65,6 +69,7 @@ function makeCtx(stateDir: string, projectRoot: string): ToolContext {
       root: projectRoot,
       aliases: [],
     },
+    ...extraProjects.map((project) => ({ ...project, aliases: [] })),
   ];
   let currentSession: unknown = { activeProjectId: null, mode: "observe", lease: null };
 
@@ -215,6 +220,7 @@ describe("Custom GPT action bridge", () => {
           CallToolInput: { properties: Record<string, unknown> };
           GoalIntakeInput: Record<string, unknown>;
           GoalLoopInput: Record<string, unknown>;
+          SessionResumeInput: Record<string, unknown>;
           E2eRunCommandInput: Record<string, unknown>;
           E2eTestAndShowScreenshotInput: Record<string, unknown>;
           E2eScreenshotInput: Record<string, unknown>;
@@ -272,8 +278,23 @@ describe("Custom GPT action bridge", () => {
     expect(body.paths["/actions/checkpoint-list"]).toBeUndefined();
     expect(body.paths["/actions/project-select"]).toBeDefined();
     expect((body.paths["/actions/project-select"] as { post: { operationId: string } }).post.operationId).toBe("project_select");
+    expect(body.paths["/actions/session-resume"]).toBeDefined();
+    expect((body.paths["/actions/session-resume"] as { post: { operationId: string } }).post.operationId).toBe("session_resume");
     expect(body.components.schemas.GoalIntakeInput).toBeDefined();
     expect(body.components.schemas.GoalLoopInput).toBeDefined();
+    expect(body.components.schemas.SessionResumeInput).toBeDefined();
+    expect((body.components.schemas.GoalIntakeInput as { properties?: Record<string, unknown> }).properties?.workSessionId).toBeDefined();
+    expect((body.components.schemas.GoalLoopInput as { properties?: Record<string, unknown> }).properties?.workSessionId).toBeDefined();
+    expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.workSessionId).toBeDefined();
+    expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.includeActiveSlice).toBeDefined();
+    expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.maxActiveSliceLines).toBeDefined();
+    expect((body.components.schemas.SessionResumeInput as { properties?: Record<string, unknown> }).properties?.validationScope).toBeDefined();
+    expect((body.components.schemas.ProjectSelectInput as { properties?: Record<string, unknown> }).properties?.resumeHint).toBeDefined();
+    expect((body.components.schemas.ProjectSelectInput as { properties?: Record<string, unknown> }).properties?.includeResumeContext).toBeDefined();
+    expect((body.components.schemas.ProjectSelectInput as { properties?: Record<string, unknown> }).properties?.includeResumeSlice).toBeDefined();
+    expect((body.components.schemas.ProjectSelectInput as { properties?: Record<string, unknown> }).properties?.maxResumeSliceLines).toBeDefined();
+    expect((body.components.schemas.ProjectSelectInput as { properties?: Record<string, unknown> }).properties?.resumeValidationScope).toBeDefined();
+    expect(body.paths["/actions/work-session-list"]).toBeUndefined();
     expect(body.components.schemas.E2eRunCommandInput).toBeDefined();
     expect(body.components.schemas.E2eTestAndShowScreenshotInput).toBeDefined();
     expect((body.components.schemas.E2eTestAndShowScreenshotInput as { properties?: Record<string, unknown> }).properties?.serverCommand).toBeUndefined();
@@ -317,6 +338,7 @@ describe("Custom GPT action bridge", () => {
     expect(body.openApiOperations).toBeLessThanOrEqual(30);
     expect(body.openApiToolNames).toContain("workspace_list_projects");
     expect(body.openApiToolNames).toContain("project_select");
+    expect(body.openApiToolNames).toContain("session_resume");
     expect(body.openApiToolNames).toContain("file_apply_patch");
     expect(body.openApiToolNames).toContain("local_shell_run");
     expect(body.openApiToolNames).toContain("e2e_test_and_show_screenshot");
@@ -694,6 +716,394 @@ describe("Custom GPT action bridge", () => {
     await expect(fs.readFile(path.join(projectRoot, "proxy-action.txt"), "utf8")).resolves.toBe("written by call-tool\n");
   });
 
+  it("resumes recent work, preserves it on same-project reselect, and flags external edits as stale", async () => {
+    await fs.writeFile(path.join(projectRoot, "portfolio.html"), "<html>v1</html>\n", "utf8");
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const selectRes = await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "start portfolio work",
+    });
+    expect(selectRes.status).toBe(200);
+
+    const readRes = await postAction(server.baseUrl, "/actions/file-read-slice", {
+      projectId: "proj",
+      path: "portfolio.html",
+      start: 1,
+      end: 1,
+    });
+    expect(readRes.status).toBe(200);
+
+    const reselectRes = await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "follow-up turn",
+    });
+    expect(reselectRes.status).toBe(200);
+
+    const resumeRes = await postAction(server.baseUrl, "/actions/session-resume", { projectId: "proj" });
+    const resumed = (await resumeRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        hasContext?: boolean;
+        activeArtifact?: string | null;
+        activeArtifactStale?: boolean | null;
+        recentFiles?: Array<{ path?: string; stale?: boolean; start?: number; end?: number }>;
+      };
+    };
+    expect(resumeRes.status).toBe(200);
+    expect(resumed.ok).toBe(true);
+    expect(resumed.structuredContent.hasContext).toBe(true);
+    expect(resumed.structuredContent.activeArtifact).toBe("portfolio.html");
+    expect(resumed.structuredContent.activeArtifactStale).toBe(false);
+    expect(resumed.structuredContent.recentFiles?.[0]).toMatchObject({
+      path: "portfolio.html",
+      stale: false,
+      start: 1,
+      end: 1,
+    });
+
+    await fs.writeFile(path.join(projectRoot, "portfolio.html"), "<html>externally changed</html>\n", "utf8");
+
+    const staleRes = await postAction(server.baseUrl, "/actions/session-resume", { projectId: "proj" });
+    const stale = (await staleRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        activeArtifactStale?: boolean | null;
+        recentFiles?: Array<{ path?: string; stale?: boolean }>;
+      };
+    };
+    expect(staleRes.status).toBe(200);
+    expect(stale.ok).toBe(true);
+    expect(stale.structuredContent.activeArtifactStale).toBe(true);
+    expect(stale.structuredContent.recentFiles?.[0]).toMatchObject({ path: "portfolio.html", stale: true });
+  });
+
+  it("hydrates the remembered active range in one resume call and preserves the range across edits", async () => {
+    const initial = Array.from({ length: 8 }, (_, index) => `initial-${index + 1}`).join("\n") + "\n";
+    await fs.writeFile(path.join(projectRoot, "hydration.html"), initial, "utf8");
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "hydrate remembered range",
+    })).status).toBe(200);
+
+    expect((await postAction(server.baseUrl, "/actions/file-read-slice", {
+      projectId: "proj",
+      path: "hydration.html",
+      start: 2,
+      end: 5,
+    })).status).toBe(200);
+
+    const edited = Array.from({ length: 8 }, (_, index) => `edited-${index + 1}`).join("\n") + "\n";
+    expect((await postAction(server.baseUrl, "/actions/file-create", {
+      projectId: "proj",
+      path: "hydration.html",
+      content: edited,
+      overwrite: true,
+    })).status).toBe(200);
+
+    const hydratedRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      includeActiveSlice: true,
+    });
+    const hydrated = (await hydratedRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        activeArtifactStale?: boolean | null;
+        activePatchPreconditionHashes?: Record<string, string> | null;
+        recentFiles?: Array<{ path?: string; start?: number; end?: number }>;
+        activeSlice?: {
+          path?: string;
+          start?: number;
+          end?: number;
+          rememberedStart?: number;
+          rememberedEnd?: number;
+          content?: string;
+          staleAtResume?: boolean;
+          truncated?: boolean;
+        } | null;
+      };
+    };
+    expect(hydratedRes.status).toBe(200);
+    expect(hydrated.ok).toBe(true);
+    expect(hydrated.structuredContent.activeArtifactStale).toBe(false);
+    expect(hydrated.structuredContent.recentFiles?.[0]).toMatchObject({
+      path: "hydration.html",
+      start: 2,
+      end: 5,
+    });
+    expect(hydrated.structuredContent.activeSlice).toMatchObject({
+      path: "hydration.html",
+      start: 2,
+      end: 5,
+      rememberedStart: 2,
+      rememberedEnd: 5,
+      staleAtResume: false,
+      truncated: false,
+    });
+    expect(hydrated.structuredContent.activeSlice?.content).toContain("edited-2");
+    expect(hydrated.structuredContent.activeSlice?.content).toContain("edited-5");
+
+    const external = Array.from({ length: 8 }, (_, index) => `external-${index + 1}`).join("\n") + "\n";
+    await fs.writeFile(path.join(projectRoot, "hydration.html"), external, "utf8");
+
+    const staleHydratedRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      includeActiveSlice: true,
+      maxActiveSliceLines: 2,
+    });
+    const staleHydrated = (await staleHydratedRes.json()) as typeof hydrated;
+    expect(staleHydratedRes.status).toBe(200);
+    expect(staleHydrated.ok).toBe(true);
+    expect(staleHydrated.structuredContent.activeArtifactStale).toBe(true);
+    expect(staleHydrated.structuredContent.activeSlice).toMatchObject({
+      start: 2,
+      end: 3,
+      rememberedStart: 2,
+      rememberedEnd: 5,
+      staleAtResume: true,
+      truncated: true,
+    });
+    expect(staleHydrated.structuredContent.activeSlice?.content).toContain("external-2");
+    expect(staleHydrated.structuredContent.activeSlice?.content).toContain("external-3");
+    expect(staleHydrated.structuredContent.activeSlice?.content).not.toContain("external-4");
+
+    const resumePreconditions = staleHydrated.structuredContent.activePatchPreconditionHashes;
+    expect(resumePreconditions?.["hydration.html"]).toMatch(/^[a-f0-9]{64}$/);
+    const casPatchRes = await postAction(server.baseUrl, "/actions/file-apply-patch", {
+      projectId: "proj",
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: hydration.html",
+        "@@",
+        "-external-2",
+        "+cas-patched-2",
+        "*** End Patch",
+      ].join("\n"),
+      preconditionHashes: resumePreconditions,
+    });
+    const casPatch = (await casPatchRes.json()) as { ok: boolean };
+    expect(casPatchRes.status).toBe(200);
+    expect(casPatch.ok).toBe(true);
+    await expect(fs.readFile(path.join(projectRoot, "hydration.html"), "utf8")).resolves.toContain("cas-patched-2");
+
+    const postPatchResumeRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      includeActiveSlice: true,
+    });
+    const postPatchResume = (await postPatchResumeRes.json()) as typeof hydrated;
+    const stalePreconditions = postPatchResume.structuredContent.activePatchPreconditionHashes;
+    expect(stalePreconditions?.["hydration.html"]).toMatch(/^[a-f0-9]{64}$/);
+
+    const raced = Array.from({ length: 8 }, (_, index) => `raced-${index + 1}`).join("\n") + "\n";
+    await fs.writeFile(path.join(projectRoot, "hydration.html"), raced, "utf8");
+    const rejectedPatchRes = await postAction(server.baseUrl, "/actions/file-apply-patch", {
+      projectId: "proj",
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: hydration.html",
+        "@@",
+        "-cas-patched-2",
+        "+should-not-apply",
+        "*** End Patch",
+      ].join("\n"),
+      preconditionHashes: stalePreconditions,
+    });
+    const rejectedPatch = (await rejectedPatchRes.json()) as {
+      ok: boolean;
+      structuredContent: { code?: string };
+    };
+    expect(rejectedPatchRes.status).toBe(200);
+    expect(rejectedPatch.ok).toBe(false);
+    expect(rejectedPatch.structuredContent.code).toBe("HASH_MISMATCH");
+    await expect(fs.readFile(path.join(projectRoot, "hydration.html"), "utf8")).resolves.not.toContain("should-not-apply");
+  });
+
+  it("keeps recent-file order and stale semantics while resume hashes are bounded-parallel", async () => {
+    for (let i = 1; i <= 6; i += 1) {
+      await fs.writeFile(path.join(projectRoot, `resume-${i}.txt`), `v1-${i}\n`, "utf8");
+    }
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    expect((await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "parallel resume hash ordering",
+    })).status).toBe(200);
+
+    for (let i = 1; i <= 6; i += 1) {
+      const read = await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: "proj",
+        path: `resume-${i}.txt`,
+        start: 1,
+        end: 1,
+      });
+      expect(read.status).toBe(200);
+    }
+
+    await fs.writeFile(path.join(projectRoot, "resume-3.txt"), "external-3\n", "utf8");
+
+    const fastResumeRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      validationScope: "active",
+    });
+    const fastResumed = (await fastResumeRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        validationScope?: "active" | "recent";
+        validatedRecentFileCount?: number;
+        recentFiles?: Array<{
+          path?: string;
+          validated?: boolean;
+          stale?: boolean | null;
+          exists?: boolean | null;
+          currentHash?: string | null;
+        }>;
+      };
+    };
+    expect(fastResumeRes.status).toBe(200);
+    expect(fastResumed.ok).toBe(true);
+    expect(fastResumed.structuredContent.validationScope).toBe("active");
+    expect(fastResumed.structuredContent.validatedRecentFileCount).toBe(1);
+    const fastRecent = fastResumed.structuredContent.recentFiles ?? [];
+    expect(fastRecent.find((file) => file.path === "resume-6.txt")).toMatchObject({
+      validated: true,
+      stale: false,
+      exists: true,
+    });
+    expect(fastRecent.find((file) => file.path === "resume-3.txt")).toMatchObject({
+      validated: false,
+      stale: null,
+      exists: null,
+      currentHash: null,
+    });
+
+    const resumeRes = await postAction(server.baseUrl, "/actions/session-resume", { projectId: "proj" });
+    const resumed = (await resumeRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        validationScope?: "active" | "recent";
+        validatedRecentFileCount?: number;
+        recentFiles?: Array<{ path?: string; validated?: boolean; stale?: boolean | null; exists?: boolean | null; currentHash?: string | null }>;
+      };
+    };
+    expect(resumeRes.status).toBe(200);
+    expect(resumed.ok).toBe(true);
+    expect(resumed.structuredContent.validationScope).toBe("recent");
+    expect(resumed.structuredContent.validatedRecentFileCount).toBe(6);
+    const recent = resumed.structuredContent.recentFiles ?? [];
+    expect(recent.map((file) => file.path)).toEqual([
+      "resume-6.txt",
+      "resume-5.txt",
+      "resume-4.txt",
+      "resume-3.txt",
+      "resume-2.txt",
+      "resume-1.txt",
+    ]);
+    expect(recent.find((file) => file.path === "resume-3.txt")?.stale).toBe(true);
+    expect(recent.filter((file) => file.path !== "resume-3.txt").every((file) => file.stale === false)).toBe(true);
+    expect(recent.every((file) => file.validated === true && file.exists === true && typeof file.currentHash === "string")).toBe(true);
+  });
+
+  it("preserves per-project work context with last mutation and verification across project switches", async () => {
+    const secondProjectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-actions-project-two-"));
+    await fs.writeFile(path.join(projectRoot, "portfolio.html"), "<html>project one</html>\n", "utf8");
+    await fs.writeFile(path.join(secondProjectRoot, "other.html"), "<html>project two</html>\n", "utf8");
+
+    try {
+      const server = await startApp(
+        makeCtx(stateDir, projectRoot, [{ projectId: "proj2", name: "proj2", root: secondProjectRoot }]),
+      );
+      stop = server.stop;
+
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj",
+        reason: "phase2 project one",
+      })).status).toBe(200);
+
+      expect((await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: "proj",
+        path: "portfolio.html",
+        start: 1,
+        end: 1,
+      })).status).toBe(200);
+
+      const verifyRes = await postAction(server.baseUrl, "/actions/local-shell-run", {
+        projectId: "proj",
+        command: "node --version",
+        intent: { writesWorkspace: false },
+      });
+      expect(verifyRes.status).toBe(200);
+
+      const createRes = await postAction(server.baseUrl, "/actions/file-create", {
+        projectId: "proj",
+        path: "phase2.txt",
+        content: "phase2\n",
+      });
+      expect(createRes.status).toBe(200);
+
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj2",
+        reason: "switch to project two",
+        confirmSwitch: true,
+      })).status).toBe(200);
+      expect((await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: "proj2",
+        path: "other.html",
+        start: 1,
+        end: 1,
+      })).status).toBe(200);
+
+      const returnToOneRes = await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj",
+        reason: "return to project one",
+        confirmSwitch: true,
+      });
+      expect(returnToOneRes.status).toBe(200);
+      const returnToOne = (await returnToOneRes.json()) as {
+        structuredContent: { hasRecentContext?: boolean; instruction?: string };
+      };
+      expect(returnToOne.structuredContent.hasRecentContext).toBe(true);
+      expect(returnToOne.structuredContent.instruction).toContain("session_resume");
+
+      const resumeOneRes = await postAction(server.baseUrl, "/actions/session-resume", { projectId: "proj" });
+      const resumeOne = (await resumeOneRes.json()) as {
+        ok: boolean;
+        structuredContent: {
+          activeArtifact?: string | null;
+          lastMutation?: { tool?: string; checkpointId?: string; files?: Array<{ path?: string; action?: string }> } | null;
+          lastVerification?: { tool?: string; command?: string; success?: boolean; exitCode?: number | null } | null;
+        };
+      };
+      expect(resumeOne.ok).toBe(true);
+      expect(resumeOne.structuredContent.activeArtifact).toBe("phase2.txt");
+      expect(resumeOne.structuredContent.lastMutation).toMatchObject({
+        tool: "file_create",
+        files: [{ path: "phase2.txt", action: "create" }],
+      });
+      expect(resumeOne.structuredContent.lastVerification).toMatchObject({
+        tool: "local_shell_run",
+        command: "node --version",
+        success: true,
+        exitCode: 0,
+      });
+
+      expect((await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj2",
+        reason: "verify project two context",
+        confirmSwitch: true,
+      })).status).toBe(200);
+      const resumeTwoRes = await postAction(server.baseUrl, "/actions/session-resume", { projectId: "proj2" });
+      const resumeTwo = (await resumeTwoRes.json()) as { structuredContent: { activeArtifact?: string | null } };
+      expect(resumeTwo.structuredContent.activeArtifact).toBe("other.html");
+    } finally {
+      await fs.rm(secondProjectRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects preset=control through the action bridge (non-blocking gap #2) on both call-tool and the project-select route", async () => {
     const ctx = makeCtx(stateDir, projectRoot);
     const server = await startApp(ctx);
@@ -892,13 +1302,24 @@ describe("Custom GPT action bridge", () => {
     const body = (await res.json()) as {
       ok: boolean;
       text: string;
-      structuredContent: { goalId?: string; nextActions?: string[]; timeoutGuidance?: string };
+      structuredContent: {
+        goalId?: string;
+        workSessionId?: string;
+        taskState?: { goalId?: string | null; currentGoal?: string | null };
+        nextActions?: string[];
+        timeoutGuidance?: string;
+      };
     };
 
     expect(res.status).toBe(200);
     expect(body.ok).toBe(true);
     expect(body.text).toContain("Continue with the next chatgpt2codex tool call now");
     expect(body.structuredContent.goalId).toMatch(/^goal-/);
+    expect(body.structuredContent.workSessionId).toMatch(/^ws_/);
+    expect(body.structuredContent.taskState).toMatchObject({
+      goalId: body.structuredContent.goalId,
+      currentGoal: "/goal deep research and implement safely",
+    });
     expect(body.structuredContent.nextActions?.join(" ")).toContain("project_select");
     expect(body.structuredContent.timeoutGuidance).toContain("intentionally fast");
     await expect(fs.readdir(path.join(stateDir, "goals"))).resolves.toHaveLength(1);
@@ -912,17 +1333,26 @@ describe("Custom GPT action bridge", () => {
       goal: "/goal implement and verify a focused change",
       projectId: "proj",
       maxTurns: 3,
+      currentTask: "wire structured task state",
+      pending: ["wire resume", "run focused tests"],
+      decisions: [
+        {
+          summary: "Use structured progress fields",
+          rationale: "Avoid parsing arbitrary lastResult prose",
+        },
+      ],
     });
     const first = (await firstRes.json()) as {
       ok: boolean;
       text: string;
-      structuredContent: { loopId?: string; turn?: number; remainingTurns?: number; nextActions?: string[] };
+      structuredContent: { loopId?: string; workSessionId?: string; turn?: number; remainingTurns?: number; nextActions?: string[] };
     };
 
     expect(firstRes.status).toBe(200);
     expect(first.ok).toBe(true);
     expect(first.text).toContain("Execute the next action batch now");
     expect(first.structuredContent.loopId).toMatch(/^loop-/);
+    expect(first.structuredContent.workSessionId).toMatch(/^ws_/);
     expect(first.structuredContent.turn).toBe(1);
     expect(first.structuredContent.remainingTurns).toBe(2);
     expect(first.structuredContent.nextActions?.join(" ")).toContain("goal_loop again");
@@ -932,14 +1362,325 @@ describe("Custom GPT action bridge", () => {
       projectId: "proj",
       maxTurns: 3,
       lastResult: "read rules and selected project",
+      currentTask: "run focused tests",
+      completed: ["wire structured task state", "wire resume"],
+      pending: ["run focused tests"],
     });
-    const second = (await secondRes.json()) as { ok: boolean; structuredContent: { turn?: number } };
+    const second = (await secondRes.json()) as { ok: boolean; structuredContent: { turn?: number; workSessionId?: string } };
 
     expect(secondRes.status).toBe(200);
     expect(second.ok).toBe(true);
     expect(second.structuredContent.turn).toBe(2);
+    expect(second.structuredContent.workSessionId).toBe(first.structuredContent.workSessionId);
     const loopFile = path.join(stateDir, "goals", `${first.structuredContent.loopId}.loop.json`);
     const loopState = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[] };
     expect(loopState.turns).toHaveLength(2);
+
+    const selectRes = await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      workSessionId: first.structuredContent.workSessionId,
+      reason: "resume semantic task state",
+    });
+    expect(selectRes.status).toBe(200);
+
+    const resumeRes = await postAction(server.baseUrl, "/actions/session-resume", {
+      projectId: "proj",
+      workSessionId: first.structuredContent.workSessionId,
+    });
+    const resumed = (await resumeRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        taskState?: {
+          loopId?: string | null;
+          currentGoal?: string | null;
+          currentTask?: string | null;
+          lastProgressSummary?: string | null;
+          completed?: string[];
+          pending?: string[];
+          decisions?: Array<{ summary?: string; rationale?: string | null }>;
+        };
+      };
+    };
+    expect(resumeRes.status).toBe(200);
+    expect(resumed.ok).toBe(true);
+    expect(resumed.structuredContent.taskState).toMatchObject({
+      loopId: first.structuredContent.loopId,
+      currentGoal: "/goal implement and verify a focused change",
+      currentTask: "run focused tests",
+      lastProgressSummary: "read rules and selected project",
+      completed: ["wire structured task state", "wire resume"],
+      pending: ["run focused tests"],
+    });
+    expect(resumed.structuredContent.taskState?.decisions?.[0]).toMatchObject({
+      summary: "Use structured progress fields",
+      rationale: "Avoid parsing arbitrary lastResult prose",
+    });
+  });
+
+  it("isolates same-project work by workSessionId and lists resumable handles", async () => {
+    await fs.writeFile(path.join(projectRoot, "alpha.html"), "<html>alpha</html>\n", "utf8");
+    await fs.writeFile(path.join(projectRoot, "beta.html"), "<html>beta</html>\n", "utf8");
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    const startGoal = async (goal: string) => {
+      const res = await postAction(server.baseUrl, "/actions/goal-intake", { goal, projectId: "proj" });
+      const body = (await res.json()) as { ok: boolean; structuredContent: { workSessionId?: string } };
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.structuredContent.workSessionId).toMatch(/^ws_/);
+      return body.structuredContent.workSessionId!;
+    };
+
+    const alphaId = await startGoal("Improve alpha portfolio layout");
+    const betaId = await startGoal("Refactor beta harness code");
+    expect(alphaId).not.toBe(betaId);
+
+    const touchSession = async (
+      workSessionId: string,
+      file: string,
+      goal: string,
+      currentTask: string,
+      verificationMarker: string,
+    ) => {
+      const selected = await postAction(server.baseUrl, "/actions/project-select", {
+        projectId: "proj",
+        workSessionId,
+        reason: `select ${workSessionId}`,
+      });
+      expect(selected.status).toBe(200);
+      const read = await postAction(server.baseUrl, "/actions/file-read-slice", {
+        projectId: "proj",
+        workSessionId,
+        path: file,
+        start: 1,
+        end: 1,
+      });
+      expect(read.status).toBe(200);
+      const write = await postAction(server.baseUrl, "/actions/file-create", {
+        projectId: "proj",
+        workSessionId,
+        path: file,
+        content: `<html>${verificationMarker} updated</html>\n`,
+        overwrite: true,
+      });
+      expect(write.status).toBe(200);
+      const verify = await postAction(server.baseUrl, "/actions/local-shell-run", {
+        projectId: "proj",
+        workSessionId,
+        command: `node -e "console.log('${verificationMarker}-check')"`,
+      });
+      expect(verify.status).toBe(200);
+      const loop = await postAction(server.baseUrl, "/actions/goal-loop", {
+        goal,
+        projectId: "proj",
+        workSessionId,
+        currentTask,
+        pending: [`finish ${file}`],
+        maxTurns: 3,
+      });
+      expect(loop.status).toBe(200);
+    };
+
+    await touchSession(alphaId, "alpha.html", "Improve alpha portfolio layout", "verify alpha layout", "alpha");
+    await touchSession(betaId, "beta.html", "Refactor beta harness code", "run beta tests", "beta");
+
+    const resume = async (workSessionId: string) => {
+      const res = await postAction(server.baseUrl, "/actions/session-resume", { projectId: "proj", workSessionId });
+      const body = (await res.json()) as {
+        ok: boolean;
+        structuredContent: {
+          workSessionId?: string | null;
+          activeArtifact?: string | null;
+          lastMutation?: { tool?: string; files?: Array<{ path?: string }> } | null;
+          lastVerification?: { tool?: string; command?: string; success?: boolean } | null;
+          taskState?: { currentGoal?: string | null; currentTask?: string | null; pending?: string[] };
+        };
+      };
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      return body.structuredContent;
+    };
+
+    const alpha = await resume(alphaId);
+    const beta = await resume(betaId);
+    expect(alpha).toMatchObject({ workSessionId: alphaId, activeArtifact: "alpha.html" });
+    expect(alpha.taskState).toMatchObject({
+      currentGoal: "Improve alpha portfolio layout",
+      currentTask: "verify alpha layout",
+      pending: ["finish alpha.html"],
+    });
+    expect(alpha.lastMutation).toMatchObject({ tool: "file_create", files: [expect.objectContaining({ path: "alpha.html" })] });
+    expect(alpha.lastVerification).toMatchObject({ tool: "local_shell_run", success: true });
+    expect(alpha.lastVerification?.command).toContain("alpha-check");
+    expect(beta).toMatchObject({ workSessionId: betaId, activeArtifact: "beta.html" });
+    expect(beta.taskState).toMatchObject({
+      currentGoal: "Refactor beta harness code",
+      currentTask: "run beta tests",
+      pending: ["finish beta.html"],
+    });
+    expect(beta.lastMutation).toMatchObject({ tool: "file_create", files: [expect.objectContaining({ path: "beta.html" })] });
+    expect(beta.lastVerification).toMatchObject({ tool: "local_shell_run", success: true });
+    expect(beta.lastVerification?.command).toContain("beta-check");
+
+    const fusedSelectRes = await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "fused beta resume",
+      resumeHint: "beta harness",
+      includeResumeContext: true,
+      includeResumeSlice: true,
+    });
+    const fusedSelect = (await fusedSelectRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        workSessionId?: string | null;
+        autoResumeApplied?: boolean;
+        autoResumeAmbiguous?: boolean;
+        autoResumeReason?: string;
+        resumeContext?: {
+          validationScope?: "active" | "recent";
+          validatedRecentFileCount?: number;
+          activeArtifact?: string | null;
+          activeArtifactStale?: boolean | null;
+          activeSlice?: { content?: string; start?: number; end?: number } | null;
+          taskState?: { currentGoal?: string | null; currentTask?: string | null };
+        } | null;
+      };
+    };
+    expect(fusedSelectRes.status).toBe(200);
+    expect(fusedSelect.ok).toBe(true);
+    expect(fusedSelect.structuredContent).toMatchObject({
+      workSessionId: betaId,
+      autoResumeApplied: true,
+      autoResumeAmbiguous: false,
+      autoResumeReason: "confident-hint-match",
+    });
+    expect(fusedSelect.structuredContent.resumeContext).toMatchObject({
+      validationScope: "active",
+      validatedRecentFileCount: 1,
+      activeArtifact: "beta.html",
+      activeArtifactStale: false,
+      taskState: {
+        currentGoal: "Refactor beta harness code",
+        currentTask: "run beta tests",
+      },
+      activeSlice: { start: 1, end: 1 },
+    });
+    expect(fusedSelect.structuredContent.resumeContext?.activeSlice?.content).toContain("beta updated");
+
+    const listRes = await postAction(server.baseUrl, "/actions/call-tool", {
+      toolName: "work_session_list",
+      input: { projectId: "proj", hint: "beta harness" },
+    });
+    const listed = (await listRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        suggestedWorkSessionId?: string | null;
+        hintApplied?: boolean;
+        retentionLimit?: number;
+        workSessions?: Array<{
+          workSessionId?: string | null;
+          activeArtifact?: string | null;
+          matchScore?: number;
+          matchReasons?: string[];
+        }>;
+      };
+    };
+    expect(listRes.status).toBe(200);
+    expect(listed.ok).toBe(true);
+    expect(listed.structuredContent.hintApplied).toBe(true);
+    expect(listed.structuredContent.retentionLimit).toBe(20);
+    expect(listed.structuredContent.suggestedWorkSessionId).toBe(betaId);
+    expect(listed.structuredContent.workSessions?.[0]).toMatchObject({
+      workSessionId: betaId,
+      activeArtifact: "beta.html",
+    });
+    expect(listed.structuredContent.workSessions?.[0]?.matchReasons?.join(" ")).toContain("hint-token-match");
+    expect(listed.structuredContent.workSessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ workSessionId: alphaId, activeArtifact: "alpha.html" }),
+        expect.objectContaining({ workSessionId: betaId, activeArtifact: "beta.html" }),
+      ]),
+    );
+  });
+
+  it("caps isolated work-session retention per project and keeps the newest session", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const ids: string[] = [];
+
+    for (let i = 0; i < 22; i += 1) {
+      const res = await postAction(server.baseUrl, "/actions/goal-intake", {
+        goal: `Retention test goal ${i}`,
+        projectId: "proj",
+      });
+      const body = (await res.json()) as { ok: boolean; structuredContent: { workSessionId?: string } };
+      expect(body.ok).toBe(true);
+      ids.push(body.structuredContent.workSessionId!);
+    }
+
+    const listRes = await postAction(server.baseUrl, "/actions/call-tool", {
+      toolName: "work_session_list",
+      input: { projectId: "proj", limit: 50 },
+    });
+    const listed = (await listRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        totalWorkSessions?: number;
+        retentionLimit?: number;
+        workSessions?: Array<{ workSessionId?: string | null }>;
+      };
+    };
+    expect(listed.ok).toBe(true);
+    expect(listed.structuredContent.retentionLimit).toBe(20);
+    expect(listed.structuredContent.totalWorkSessions).toBe(20);
+    expect(listed.structuredContent.workSessions).toHaveLength(20);
+    const retainedIds = listed.structuredContent.workSessions?.map((session) => session.workSessionId) ?? [];
+    expect(retainedIds).toContain(ids.at(-1));
+    expect(retainedIds).not.toContain(ids[0]);
+    expect(retainedIds).not.toContain(ids[1]);
+  });
+
+  it("does not auto-resume when two hint-matching work sessions are too close", async () => {
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+
+    for (const goal of ["Shared dashboard alpha task", "Shared dashboard beta task"]) {
+      const goalRes = await postAction(server.baseUrl, "/actions/goal-intake", {
+        goal,
+        projectId: "proj",
+      });
+      expect(goalRes.status).toBe(200);
+    }
+
+    const selectRes = await postAction(server.baseUrl, "/actions/project-select", {
+      projectId: "proj",
+      reason: "ambiguous fused resume",
+      resumeHint: "shared dashboard",
+      includeResumeContext: true,
+      includeResumeSlice: true,
+    });
+    const selected = (await selectRes.json()) as {
+      ok: boolean;
+      structuredContent: {
+        workSessionId?: string | null;
+        autoResumeApplied?: boolean;
+        autoResumeAmbiguous?: boolean;
+        autoResumeReason?: string;
+        resumeCandidates?: Array<{ workSessionId?: string | null; matchScore?: number; matchReasons?: string[] }>;
+        resumeContext?: unknown;
+      };
+    };
+    expect(selectRes.status).toBe(200);
+    expect(selected.ok).toBe(true);
+    expect(selected.structuredContent.workSessionId).toBeNull();
+    expect(selected.structuredContent.autoResumeApplied).toBe(false);
+    expect(selected.structuredContent.autoResumeAmbiguous).toBe(true);
+    expect(selected.structuredContent.autoResumeReason).toBe("top-candidates-too-close");
+    expect(selected.structuredContent.resumeContext).toBeNull();
+    expect(selected.structuredContent.resumeCandidates).toHaveLength(2);
+    expect(selected.structuredContent.resumeCandidates?.every((candidate) =>
+      candidate.matchReasons?.includes("full-hint-match"),
+    )).toBe(true);
   });
 });

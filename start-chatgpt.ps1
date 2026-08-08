@@ -10,6 +10,37 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+function Resolve-DevelopmentSourceRoot([string]$RuntimeRoot) {
+    try {
+        $candidate = [System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot "..\..\.."))
+        $expectedRuntime = [System.IO.Path]::GetFullPath((Join-Path $candidate "build\windows\chatgpt2codex"))
+        $sourceLauncher = Join-Path $candidate "start-chatgpt.ps1"
+        $sourceDir = Join-Path $candidate "src"
+        $packageJson = Join-Path $candidate "package.json"
+        if (
+            [System.IO.Path]::GetFullPath($RuntimeRoot).Equals($expectedRuntime, [System.StringComparison]::OrdinalIgnoreCase) -and
+            (Test-Path -LiteralPath $sourceLauncher) -and
+            (Test-Path -LiteralPath $sourceDir) -and
+            (Test-Path -LiteralPath $packageJson)
+        ) {
+            return $candidate
+        }
+    } catch {
+    }
+    return $null
+}
+
+$developmentSourceRoot = Resolve-DevelopmentSourceRoot $Root
+if ($developmentSourceRoot) {
+    $sourceLauncher = Join-Path $developmentSourceRoot "start-chatgpt.ps1"
+    Write-Host "[chatgpt2codex] development package detected; delegating to source checkout: $developmentSourceRoot"
+    $env:PATH = "$Root\bin;$env:PATH"
+    & $sourceLauncher @PSBoundParameters
+    if ($?) { exit 0 }
+    exit 1
+}
+
 $machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
 $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
 $nodePath = Join-Path $env:ProgramFiles "nodejs"
@@ -35,6 +66,37 @@ function Need-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "Missing command: $Name"
     }
+}
+
+function Test-SourceBuildRequired([string]$SourceRoot) {
+    $cliPath = Join-Path $SourceRoot "dist\cli.js"
+    if (-not (Test-Path -LiteralPath $cliPath)) {
+        return $true
+    }
+
+    $sourceDir = Join-Path $SourceRoot "src"
+    if (-not (Test-Path -LiteralPath $sourceDir)) {
+        return $false
+    }
+
+    $distStamp = (Get-Item -LiteralPath $cliPath).LastWriteTimeUtc
+    $watchFiles = @(
+        (Join-Path $SourceRoot "package.json"),
+        (Join-Path $SourceRoot "package-lock.json"),
+        (Join-Path $SourceRoot "tsconfig.json")
+    )
+    foreach ($file in $watchFiles) {
+        if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).LastWriteTimeUtc -gt $distStamp) {
+            return $true
+        }
+    }
+
+    foreach ($file in Get-ChildItem -LiteralPath $sourceDir -Recurse -File -ErrorAction SilentlyContinue) {
+        if ($file.LastWriteTimeUtc -gt $distStamp) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Quote-Arg([string]$Value) {
@@ -261,10 +323,17 @@ function Stop-StaleRuntimeProcesses([int]$PortToStop) {
 Need-Command node
 Set-Location $Root
 
-if (-not (Test-Path (Join-Path $Root "dist\cli.js"))) {
+if (Test-SourceBuildRequired $Root) {
     Need-Command npm
-    Write-Host "[chatgpt2codex] dist/cli.js missing; building..."
+    if (Test-Path (Join-Path $Root "dist\cli.js")) {
+        Write-Host "[chatgpt2codex] source is newer than dist/cli.js; rebuilding..."
+    } else {
+        Write-Host "[chatgpt2codex] dist/cli.js missing; building..."
+    }
     npm run build
+    if ($LASTEXITCODE -ne 0) {
+        throw "TypeScript build failed."
+    }
 }
 
 Stop-StaleRuntimeProcesses $Port

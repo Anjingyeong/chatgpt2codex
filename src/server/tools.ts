@@ -53,7 +53,7 @@ import {
   handleComputerRequestAction,
   handleComputerScreenshot,
 } from "../control/tools.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import path from "node:path";
@@ -63,31 +63,639 @@ import path from "node:path";
 // ---------------------------------------------------------------------------
 
 /** Shape persisted in sessions.json (PRD §10) — mirrors state/store.ts SessionDocument. */
+interface RecentWorkFile {
+  path: string;
+  fileHash: string | null;
+  lastAction: "read" | "edit" | "create" | "delete" | "move";
+  lastTouchedAt: number;
+  start?: number;
+  end?: number;
+}
+
+interface MutationFileSummary {
+  path: string;
+  action: "add" | "update" | "delete" | "move" | "create";
+  added?: number;
+  removed?: number;
+}
+
+interface LastMutation {
+  checkpointId: string;
+  tool: "file_apply_patch" | "file_create";
+  files: MutationFileSummary[];
+  at: number;
+}
+
+interface LastVerification {
+  tool: "command_run" | "local_shell_run" | "e2e_run_command" | "e2e_test_and_show_screenshot";
+  command: string;
+  success: boolean;
+  exitCode: number | null;
+  durationMs: number | null;
+  at: number;
+}
+
+interface TaskDecision {
+  summary: string;
+  rationale: string | null;
+  at: number;
+}
+
+interface TaskState {
+  goalId: string | null;
+  loopId: string | null;
+  currentGoal: string | null;
+  currentTask: string | null;
+  lastProgressSummary: string | null;
+  completed: string[];
+  pending: string[];
+  decisions: TaskDecision[];
+  updatedAt: number;
+}
+
+interface WorkContext {
+  projectId: string;
+  workSessionId: string | null;
+  activeArtifact: string | null;
+  recentFiles: RecentWorkFile[];
+  lastCheckpointId: string | null;
+  lastMutation: LastMutation | null;
+  lastVerification: LastVerification | null;
+  taskState: TaskState;
+  lastActivityAt: number;
+}
+
 interface SessionState {
   version?: number;
   updatedAt?: number;
   activeProjectId: string | null;
   mode: ExecutionMode;
   lease: Lease | null;
+  workContexts: Record<string, WorkContext>;
+  workSessions: Record<string, Record<string, WorkContext>>;
 }
 
 function emptySession(): SessionState {
-  return { activeProjectId: null, mode: "observe", lease: null };
+  return { activeProjectId: null, mode: "observe", lease: null, workContexts: {}, workSessions: {} };
 }
 
-async function loadSession(ctx: ToolContext): Promise<SessionState> {
-  const raw = await ctx.store.getSession();
+function coerceSessionState(raw: unknown): SessionState {
   if (!raw || typeof raw !== "object") return emptySession();
   const s = raw as Partial<SessionState>;
   return {
     activeProjectId: s.activeProjectId ?? null,
     mode: s.mode ?? "observe",
     lease: (s.lease as Lease | null | undefined) ?? null,
+    workContexts: (s.workContexts as Record<string, WorkContext> | undefined) ?? {},
+    workSessions: (s.workSessions as Record<string, Record<string, WorkContext>> | undefined) ?? {},
   };
+}
+
+async function loadSession(ctx: ToolContext): Promise<SessionState> {
+  return coerceSessionState(await ctx.store.getSession());
 }
 
 async function saveSession(ctx: ToolContext, session: SessionState): Promise<void> {
   await ctx.store.setSession(session);
+}
+
+async function updateSessionState(
+  ctx: ToolContext,
+  mutator: (current: SessionState) => SessionState | Promise<SessionState>,
+): Promise<SessionState> {
+  if (ctx.store.updateSession) {
+    const updated = await ctx.store.updateSession(async (raw) => mutator(coerceSessionState(raw)));
+    return coerceSessionState(updated);
+  }
+  // Compatibility fallback for lightweight test doubles/adapters that have
+  // not implemented the atomic update API yet.
+  const current = await loadSession(ctx);
+  const next = await mutator(current);
+  await saveSession(ctx, next);
+  return next;
+}
+
+async function hashProjectFile(root: string, rel: string): Promise<string | null> {
+  try {
+    const abs = await resolveInProject(root, rel, { allowSymlink: false });
+    const bytes = await fs.readFile(abs);
+    return createHash("sha256").update(bytes).digest("hex");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+function makeEmptyWorkContext(projectId: string, now = Date.now(), workSessionId: string | null = null): WorkContext {
+  return {
+    projectId,
+    workSessionId,
+    activeArtifact: null,
+    recentFiles: [],
+    lastCheckpointId: null,
+    lastMutation: null,
+    lastVerification: null,
+    taskState: makeEmptyTaskState(now),
+    lastActivityAt: now,
+  };
+}
+
+function createWorkSessionId(): string {
+  return `ws_${Date.now()}_${randomUUID().slice(0, 8)}`;
+}
+
+const WorkSessionIdSchema = z.string().regex(/^ws_[A-Za-z0-9_.-]+$/).max(120);
+const MAX_WORK_SESSIONS_PER_PROJECT = 20;
+
+function getWorkContext(
+  session: SessionState,
+  projectId: string,
+  workSessionId?: string,
+): WorkContext | null {
+  if (workSessionId) {
+    return session.workSessions[projectId]?.[workSessionId] ?? null;
+  }
+  return session.workContexts[projectId] ?? null;
+}
+
+function withWorkContext(
+  session: SessionState,
+  projectId: string,
+  workSessionId: string | undefined,
+  context: WorkContext,
+): SessionState {
+  if (!workSessionId) {
+    return {
+      ...session,
+      workContexts: {
+        ...session.workContexts,
+        [projectId]: context,
+      },
+    };
+  }
+  const nextProjectSessions = {
+    ...(session.workSessions[projectId] ?? {}),
+    [workSessionId]: context,
+  };
+  const retainedOthers = Object.entries(nextProjectSessions)
+    .filter(([id]) => id !== workSessionId)
+    .sort(([, a], [, b]) => b.lastActivityAt - a.lastActivityAt)
+    .slice(0, MAX_WORK_SESSIONS_PER_PROJECT - 1);
+  const retainedProjectSessions = Object.fromEntries([
+    [workSessionId, context],
+    ...retainedOthers,
+  ]);
+  return {
+    ...session,
+    workSessions: {
+      ...session.workSessions,
+      [projectId]: retainedProjectSessions,
+    },
+  };
+}
+
+function normalizeSessionMatchText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}._-]+/gu, " ")
+    .trim();
+}
+
+function scoreWorkSessionMatch(
+  context: WorkContext,
+  hint: string | undefined,
+  now: number,
+): { score: number; reasons: string[] } {
+  let score = 0;
+  const reasons: string[] = [];
+  const ageMs = Math.max(0, now - context.lastActivityAt);
+  if (ageMs <= 60 * 60 * 1000) {
+    score += 30;
+    reasons.push("active-within-1h");
+  } else if (ageMs <= 24 * 60 * 60 * 1000) {
+    score += 20;
+    reasons.push("active-within-24h");
+  } else if (ageMs <= 7 * 24 * 60 * 60 * 1000) {
+    score += 10;
+    reasons.push("active-within-7d");
+  }
+
+  const pendingCount = context.taskState?.pending?.length ?? 0;
+  if (pendingCount > 0) {
+    score += Math.min(10, pendingCount * 2);
+    reasons.push("has-pending-work");
+  }
+
+  const normalizedHint = hint ? normalizeSessionMatchText(hint) : "";
+  if (normalizedHint) {
+    const searchable = normalizeSessionMatchText(
+      [
+        context.taskState?.currentGoal ?? "",
+        context.taskState?.currentTask ?? "",
+        context.activeArtifact ?? "",
+      ].join(" "),
+    );
+    if (searchable.includes(normalizedHint)) {
+      score += 80;
+      reasons.push("full-hint-match");
+    }
+    const tokens = [...new Set(normalizedHint.split(/\s+/).filter((token) => token.length >= 2))];
+    const matchedTokens = tokens.filter((token) => searchable.includes(token));
+    if (matchedTokens.length > 0) {
+      score += Math.min(60, matchedTokens.length * 15);
+      reasons.push(`hint-token-match:${matchedTokens.length}/${tokens.length}`);
+    }
+  }
+
+  return { score, reasons };
+}
+
+interface RankedWorkSession {
+  context: WorkContext;
+  workSessionId: string | null;
+  currentGoal: string | null;
+  currentTask: string | null;
+  activeArtifact: string | null;
+  lastActivityAt: number;
+  pendingCount: number;
+  matchScore: number;
+  matchReasons: string[];
+}
+
+function rankWorkSessions(
+  session: SessionState,
+  projectId: string,
+  hint: string | undefined,
+  limit = 10,
+): RankedWorkSession[] {
+  const now = Date.now();
+  return Object.values(session.workSessions[projectId] ?? {})
+    .map((context) => {
+      const match = scoreWorkSessionMatch(context, hint, now);
+      return {
+        context,
+        workSessionId: context.workSessionId,
+        currentGoal: context.taskState?.currentGoal ?? null,
+        currentTask: context.taskState?.currentTask ?? null,
+        activeArtifact: context.activeArtifact,
+        lastActivityAt: context.lastActivityAt,
+        pendingCount: context.taskState?.pending?.length ?? 0,
+        matchScore: match.score,
+        matchReasons: match.reasons,
+      };
+    })
+    .sort((a, b) => b.matchScore - a.matchScore || b.lastActivityAt - a.lastActivityAt)
+    .slice(0, limit);
+}
+
+function hasHintMatch(candidate: RankedWorkSession | undefined): boolean {
+  return Boolean(
+    candidate?.matchReasons.some(
+      (reason) => reason === "full-hint-match" || reason.startsWith("hint-token-match:"),
+    ),
+  );
+}
+
+function chooseResumeCandidate(candidates: RankedWorkSession[]): {
+  selected: RankedWorkSession | null;
+  ambiguous: boolean;
+  reason: string;
+} {
+  const first = candidates[0];
+  if (!first || !hasHintMatch(first)) {
+    return { selected: null, ambiguous: false, reason: "no-hint-match" };
+  }
+  const second = candidates[1];
+  if (second && hasHintMatch(second) && first.matchScore - second.matchScore < 15) {
+    return { selected: null, ambiguous: true, reason: "top-candidates-too-close" };
+  }
+  return { selected: first, ambiguous: false, reason: "confident-hint-match" };
+}
+
+interface ResumeFileState extends RecentWorkFile {
+  validated: boolean;
+  currentHash: string | null;
+  exists: boolean | null;
+  stale: boolean | null;
+}
+
+interface ResumeActiveSlice {
+  path: string;
+  start: number;
+  end: number;
+  rememberedStart: number;
+  rememberedEnd: number;
+  content: string;
+  staleAtResume: boolean;
+  currentHash: string | null;
+  truncated: boolean;
+}
+
+interface ResumeSnapshot {
+  validationScope: "active" | "recent";
+  validatedRecentFileCount: number;
+  activeArtifact: string | null;
+  activeArtifactStale: boolean | null;
+  activePatchPreconditionHashes: Record<string, string> | null;
+  recentFiles: ResumeFileState[];
+  lastCheckpointId: string | null;
+  lastMutation: LastMutation | null;
+  lastVerification: LastVerification | null;
+  taskState: TaskState;
+  activeSlice: ResumeActiveSlice | null;
+  activeSliceReason: string | null;
+  lastActivityAt: number;
+}
+
+const RESUME_HASH_CONCURRENCY = 4;
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]!, index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function buildResumeSnapshot(
+  ctx: ToolContext,
+  entry: ProjectRegistryEntry,
+  workContext: WorkContext,
+  options: {
+    includeActiveSlice?: boolean;
+    maxActiveSliceLines?: number;
+    validationScope?: "active" | "recent";
+  } = {},
+): Promise<ResumeSnapshot> {
+  const validationScope = options.validationScope ?? "recent";
+  const shouldValidate = (recent: RecentWorkFile): boolean =>
+    validationScope === "recent" || recent.path === workContext.activeArtifact;
+  const recentFiles = await mapWithConcurrency(
+    workContext.recentFiles,
+    RESUME_HASH_CONCURRENCY,
+    async (recent): Promise<ResumeFileState> => {
+      if (!shouldValidate(recent)) {
+        return {
+          ...recent,
+          validated: false,
+          currentHash: null,
+          exists: null,
+          stale: null,
+        };
+      }
+      const currentHash = await hashProjectFile(entry.root, recent.path);
+      return {
+        ...recent,
+        validated: true,
+        currentHash,
+        exists: currentHash !== null,
+        stale: currentHash !== recent.fileHash,
+      };
+    },
+  );
+  const active = recentFiles.find((file) => file.path === workContext.activeArtifact) ?? null;
+  let activeSlice: ResumeActiveSlice | null = null;
+  let activeSliceReason: string | null = null;
+  if (options.includeActiveSlice) {
+    if (!active) {
+      activeSliceReason = "active-artifact-not-in-recent-files";
+    } else if (active.exists === false) {
+      activeSliceReason = "active-artifact-missing";
+    } else if (active.start === undefined || active.end === undefined) {
+      activeSliceReason = "no-remembered-line-range";
+    } else {
+      const abs = await resolveInProject(entry.root, active.path, { allowSymlink: false });
+      await guardSecretPath(ctx, abs, "session_resume");
+      const maxLines = options.maxActiveSliceLines ?? 160;
+      const requestedEnd = Math.min(active.end, active.start + maxLines - 1);
+      const slice = await readSlice(entry.root, active.path, active.start, requestedEnd);
+      activeSlice = {
+        path: active.path,
+        start: slice.start,
+        end: slice.end,
+        rememberedStart: active.start,
+        rememberedEnd: active.end,
+        content: redact(slice.content),
+        staleAtResume: active.stale ?? false,
+        currentHash: active.currentHash,
+        truncated: requestedEnd < active.end,
+      };
+    }
+  }
+  return {
+    validationScope,
+    validatedRecentFileCount: recentFiles.filter((file) => file.validated).length,
+    activeArtifact: workContext.activeArtifact,
+    activeArtifactStale: active?.stale ?? null,
+    activePatchPreconditionHashes:
+      active?.validated && active.exists === true && active.currentHash
+        ? { [active.path]: active.currentHash }
+        : null,
+    recentFiles,
+    lastCheckpointId: workContext.lastCheckpointId,
+    lastMutation: workContext.lastMutation,
+    lastVerification: workContext.lastVerification,
+    taskState: workContext.taskState ?? makeEmptyTaskState(workContext.lastActivityAt),
+    activeSlice,
+    activeSliceReason,
+    lastActivityAt: workContext.lastActivityAt,
+  };
+}
+
+function makeEmptyTaskState(now = Date.now()): TaskState {
+  return {
+    goalId: null,
+    loopId: null,
+    currentGoal: null,
+    currentTask: null,
+    lastProgressSummary: null,
+    completed: [],
+    pending: [],
+    decisions: [],
+    updatedAt: now,
+  };
+}
+
+function cleanTaskText(value: string, maxLength: number): string | null {
+  const cleaned = redact(value).trim().slice(0, maxLength);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function mergeUniqueTaskItems(existing: string[], additions: string[], maxItems = 50): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [...existing, ...additions]) {
+    const cleaned = cleanTaskText(raw, 500);
+    if (!cleaned || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    merged.push(cleaned);
+    if (merged.length >= maxItems) break;
+  }
+  return merged;
+}
+
+async function recordTaskProgress(
+  ctx: ToolContext,
+  projectId: string,
+  workSessionId: string | undefined,
+  update: {
+    goalId?: string;
+    loopId?: string;
+    currentGoal?: string;
+    currentTask?: string;
+    lastProgressSummary?: string;
+    completed?: string[];
+    pending?: string[];
+    decisions?: Array<{ summary: string; rationale?: string }>;
+  },
+): Promise<TaskState> {
+  const now = Date.now();
+  let recorded: TaskState | null = null;
+  await updateSessionState(ctx, async (session) => {
+    const current = getWorkContext(session, projectId, workSessionId) ?? makeEmptyWorkContext(projectId, now, workSessionId ?? null);
+    const previous = current.taskState ?? makeEmptyTaskState(now);
+    const appendedDecisions = (update.decisions ?? [])
+      .map((decision) => ({
+        summary: cleanTaskText(decision.summary, 500),
+        rationale: decision.rationale === undefined ? null : cleanTaskText(decision.rationale, 1000),
+        at: now,
+      }))
+      .filter((decision): decision is TaskDecision => decision.summary !== null);
+    const decisionMap = new Map<string, TaskDecision>();
+    for (const decision of [...previous.decisions, ...appendedDecisions]) {
+      decisionMap.set(`${decision.summary}\n${decision.rationale ?? ""}`, decision);
+    }
+    const taskState: TaskState = {
+      ...previous,
+      goalId: update.goalId ?? previous.goalId,
+      loopId: update.loopId ?? previous.loopId,
+      currentGoal:
+        update.currentGoal === undefined ? previous.currentGoal : cleanTaskText(update.currentGoal, 1000),
+      currentTask:
+        update.currentTask === undefined ? previous.currentTask : cleanTaskText(update.currentTask, 500),
+      lastProgressSummary:
+        update.lastProgressSummary === undefined
+          ? previous.lastProgressSummary
+          : cleanTaskText(update.lastProgressSummary, 1000),
+      completed:
+        update.completed === undefined
+          ? previous.completed
+          : mergeUniqueTaskItems(previous.completed, update.completed),
+      pending:
+        update.pending === undefined ? previous.pending : mergeUniqueTaskItems([], update.pending),
+      decisions: [...decisionMap.values()].slice(-30),
+      updatedAt: now,
+    };
+    recorded = taskState;
+    return withWorkContext(session, projectId, workSessionId, {
+      ...current,
+      taskState,
+      lastActivityAt: now,
+    });
+  });
+  return recorded ?? makeEmptyTaskState(now);
+}
+
+async function recordRecentWork(
+  ctx: ToolContext,
+  input: {
+    projectId: string;
+    path: string;
+    fileHash: string | null;
+    lastAction: RecentWorkFile["lastAction"];
+    start?: number;
+    end?: number;
+    checkpointId?: string;
+    workSessionId?: string;
+  },
+): Promise<void> {
+  const now = Date.now();
+  await updateSessionState(ctx, async (session) => {
+    if (session.activeProjectId !== input.projectId) return session;
+    const current = getWorkContext(session, input.projectId, input.workSessionId);
+    const previousForPath = current?.recentFiles.find((file) => file.path === input.path);
+    const entry: RecentWorkFile = {
+      path: input.path,
+      fileHash: input.fileHash,
+      lastAction: input.lastAction,
+      lastTouchedAt: now,
+      ...(input.start !== undefined
+        ? { start: input.start }
+        : previousForPath?.start !== undefined
+          ? { start: previousForPath.start }
+          : {}),
+      ...(input.end !== undefined
+        ? { end: input.end }
+        : previousForPath?.end !== undefined
+          ? { end: previousForPath.end }
+          : {}),
+    };
+    const recentFiles = [entry, ...(current?.recentFiles ?? []).filter((f) => f.path !== input.path)].slice(0, 20);
+    const removesCurrentPath = input.lastAction === "delete" || input.lastAction === "move";
+    const nextActiveArtifact =
+      removesCurrentPath
+        ? current?.activeArtifact === input.path
+          ? (recentFiles.find((f) => f.lastAction !== "delete" && f.lastAction !== "move" && f.fileHash !== null)?.path ?? null)
+          : (current?.activeArtifact ?? null)
+        : input.path;
+    return withWorkContext(session, input.projectId, input.workSessionId, {
+      ...(current ?? makeEmptyWorkContext(input.projectId, now, input.workSessionId ?? null)),
+      activeArtifact: nextActiveArtifact,
+      recentFiles,
+      lastCheckpointId: input.checkpointId ?? current?.lastCheckpointId ?? null,
+      lastActivityAt: now,
+    });
+  });
+}
+
+async function recordLastMutation(
+  ctx: ToolContext,
+  projectId: string,
+  workSessionId: string | undefined,
+  mutation: Omit<LastMutation, "at">,
+): Promise<void> {
+  const now = Date.now();
+  await updateSessionState(ctx, async (session) => {
+    if (session.activeProjectId !== projectId) return session;
+    const current = getWorkContext(session, projectId, workSessionId) ?? makeEmptyWorkContext(projectId, now, workSessionId ?? null);
+    return withWorkContext(session, projectId, workSessionId, {
+      ...current,
+      lastCheckpointId: mutation.checkpointId,
+      lastMutation: { ...mutation, at: now },
+      lastActivityAt: now,
+    });
+  });
+}
+
+async function recordVerification(
+  ctx: ToolContext,
+  projectId: string,
+  workSessionId: string | undefined,
+  verification: Omit<LastVerification, "at">,
+): Promise<void> {
+  const now = Date.now();
+  await updateSessionState(ctx, async (session) => {
+    if (session.activeProjectId !== projectId) return session;
+    const current = getWorkContext(session, projectId, workSessionId) ?? makeEmptyWorkContext(projectId, now, workSessionId ?? null);
+    return withWorkContext(session, projectId, workSessionId, {
+      ...current,
+      lastVerification: { ...verification, at: now },
+      lastActivityAt: now,
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +1136,7 @@ async function e2eScreenshotPayload(shots: E2eDeliverableShot[]): Promise<{
   const images: Array<{ type: "image"; data: string; mimeType: "image/png" | "image/jpeg" }> = [];
   const widgetShots: Array<Record<string, unknown>> = [];
   let totalChars = 0;
-  for (const [index, shot] of shots.slice(0, 3).entries()) {
+  for (const [index, shot] of shots.slice(0, 6).entries()) {
     const label = shot.shotLabel ? `E2E screenshot (${shot.shotLabel})` : `E2E screenshot ${index + 1}`;
     const preview = await createE2eScreenshotPreview(shot.path);
     const filePath = preview?.path ?? shot.path;
@@ -834,8 +1442,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "Report: include changed files, verification command/output, proof artifact, and remaining risk without claiming unstaged work is committed.",
             ],
             toolSurfaceMap: {
-              discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_select"],
-              inspect: ["project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
+              discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_select", "work_session_list", "session_resume"],
+              inspect: ["work_session_list", "session_resume", "project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
               modify: ["file_apply_patch", "file_create", "local_shell_run"],
               verify: ["command_list", "local_shell_run", "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"],
               release: ["git_diff_summary", "git_commit", "git_push", "checkpoint_list"],
@@ -859,7 +1467,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "If only image_gen, python_user_visible, browser, or a text-only answer ran, no chatgpt2codex work happened. Stop and ask the user to reselect ChatGPT To Codex, reconnect the app, or refresh the Custom GPT Action.",
               "If ChatGPT's app selector changed to Image Generation/ImageGen, finish generation there, then reselect ChatGPT To Codex or use the Custom GPT Action bridge before doing source work.",
               "For /goal, deep research, or broad implementation prompts: call goal_loop or goal_intake immediately, then continue with project selection and inspection. Do not spend a long thinking turn before the first tool call.",
-              "For Codex-style persistence: use goal_loop, perform one small inspect/edit/verify batch, then call goal_loop again with lastResult. Repeat until done or truly blocked.",
+              "For Codex-style persistence: use goal_loop, perform one small inspect/edit/verify batch, then call goal_loop again with lastResult plus currentTask/completed/pending/decisions when known. This keeps semantic progress resumable without parsing prose. Repeat until done or truly blocked.",
+              "When goal_intake or goal_loop returns workSessionId, keep passing that same workSessionId to project_select, session_resume, file read/write, verification, E2E, and later goal_loop calls for that task. This isolates same-project conversations/workflows.",
+              "If a follow-up says to continue prior same-project work and the project is known but workSessionId is not, prefer project_select with resumeHint plus includeResumeContext=true/includeResumeSlice=true. It only auto-resolves when the hint has a confident lexical match; if autoResumeAmbiguous=true, compare resumeCandidates and retry with an explicit workSessionId. Use work_session_list when you need a read-only candidate lookup without changing the active project.",
+              "Fused project_select resume defaults to active-only hash validation for speed. If the next change depends on multiple remembered files being mutually current, request resumeValidationScope=recent or call session_resume with validationScope=recent before editing those files. Never treat stale=null with validated=false as unchanged.",
+              "When resumeContext/session_resume returns activePatchPreconditionHashes together with the source slice you will edit, pass that object directly as file_apply_patch.preconditionHashes. It is the current full-file SHA-256 from the same resume snapshot, so it provides CAS-style protection without another read. If the patch is rejected with HASH_MISMATCH, re-resume/re-read before retrying.",
+              "For follow-up requests on recent work: after project_select, call session_resume with includeActiveSlice=true before broad code_search. If activeSlice is returned it is a fresh disk read of the remembered range; activeArtifactStale still tells you whether the file changed since the stored snapshot. If no activeSlice is available, fall back to narrow file_read_slice or code_search.",
               "workspace_list_projects or workspace_refresh_index",
               "project_select with preset=full-write for edits",
               "project_rules, project_status, code_search",
@@ -935,6 +1548,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       inputSchema: {
         goal: z.string().min(1),
         projectId: z.string().optional(),
+        workSessionId: WorkSessionIdSchema.optional(),
         mode: z.enum(["implement", "research", "debug", "review", "plan"]).optional(),
         urgency: z.enum(["normal", "fast"]).optional(),
       },
@@ -942,19 +1556,27 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input) => {
       return withErrorMapping(ctx, "goal_intake", { ...input, goal: "[goal redacted]" }, async () => {
         const goal = input.goal.trim();
+        const workSessionId = input.projectId ? (input.workSessionId ?? createWorkSessionId()) : undefined;
         const goalId = await writeGoalIntake(ctx, {
           goalId: goalIdFor(goal),
           goalPreview: redact(goal).slice(0, 1000),
           projectId: input.projectId,
+          workSessionId,
           mode: input.mode ?? "implement",
           urgency: input.urgency ?? "normal",
           createdAt: new Date().toISOString(),
         });
+        const taskState = input.projectId
+          ? await recordTaskProgress(ctx, input.projectId, workSessionId, {
+              goalId,
+              currentGoal: goal,
+            })
+          : undefined;
         const nextActions = input.projectId
           ? [
-              `Call project_select with projectId=${input.projectId}, preset=full-write, reason=goal ${goalId}.`,
+              `Call project_select with projectId=${input.projectId}, workSessionId=${workSessionId}, preset=full-write, reason=goal ${goalId}.`,
               "Call project_rules and project_status.",
-              "Call code_search for the first implementation slice, then file_read_slice on the matching files.",
+              `Call code_search for the first implementation slice, then file_read_slice with workSessionId=${workSessionId} on the matching files.`,
               "Apply small patches and verify each slice; keep every tool call under roughly 20 seconds.",
             ]
           : [
@@ -966,6 +1588,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         return makeResult(
           {
             goalId,
+            workSessionId,
+            taskState,
             nextActions,
             timeoutGuidance:
               "This tool is intentionally fast. Continue with short inspect/edit/verify tool calls instead of one long action or a silent 30s thinking turn.",
@@ -988,9 +1612,22 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         goal: z.string().min(1).optional(),
         loopId: z.string().min(1).optional(),
         projectId: z.string().optional(),
+        workSessionId: WorkSessionIdSchema.optional(),
         mode: z.enum(["implement", "research", "debug", "review", "plan"]).optional(),
         maxTurns: z.number().int().min(1).max(50).optional(),
         lastResult: z.string().optional(),
+        currentTask: z.string().max(500).optional(),
+        completed: z.array(z.string().min(1).max(500)).max(50).optional(),
+        pending: z.array(z.string().min(1).max(500)).max(50).optional(),
+        decisions: z
+          .array(
+            z.object({
+              summary: z.string().min(1).max(500),
+              rationale: z.string().max(1000).optional(),
+            }),
+          )
+          .max(10)
+          .optional(),
       },
     },
     async (input) => {
@@ -1001,9 +1638,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const loopFile = path.join(ctx.stateDir, "goals", `${loopId}.loop.json`);
         let previousTurns = 0;
         let existingTurns: unknown[] = [];
+        let existingWorkSessionId: string | undefined;
         try {
-          const existing = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[] };
+          const existing = JSON.parse(await fs.readFile(loopFile, "utf8")) as { turns?: unknown[]; workSessionId?: string };
           existingTurns = Array.isArray(existing.turns) ? existing.turns : [];
+          existingWorkSessionId = existing.workSessionId;
           previousTurns = existingTurns.length;
         } catch {
           existingTurns = [];
@@ -1011,12 +1650,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         const turn = previousTurns + 1;
         const remainingTurns = Math.max(0, maxTurns - turn);
+        const workSessionId =
+          input.workSessionId ??
+          existingWorkSessionId ??
+          (input.projectId && previousTurns === 0 ? createWorkSessionId() : undefined);
         const nextActions = input.projectId
           ? [
-              `Call project_select with projectId=${input.projectId}, preset=full-write, reason=loop ${loopId} turn ${turn}.`,
+              `Call project_select with projectId=${input.projectId}${workSessionId ? `, workSessionId=${workSessionId}` : ""}, preset=full-write, reason=loop ${loopId} turn ${turn}.`,
               "Call project_rules and project_status if they are not already fresh in this chat.",
-              "Read the smallest relevant context slice, apply one coherent patch/create batch, then run the closest verification command.",
-              `Call goal_loop again with loopId=${loopId}, projectId=${input.projectId}, maxTurns=${maxTurns}, and lastResult summarizing the batch.`,
+              `Read the smallest relevant context slice${workSessionId ? ` with workSessionId=${workSessionId}` : ""}, apply one coherent patch/create batch, then run the closest verification command.`,
+              `Call goal_loop again with loopId=${loopId}, projectId=${input.projectId}${workSessionId ? `, workSessionId=${workSessionId}` : ""}, maxTurns=${maxTurns}, and lastResult summarizing the batch; include currentTask/completed/pending/decisions when they changed.`,
             ]
           : [
               "Call workspace_list_projects or workspace_refresh_index now.",
@@ -1030,6 +1673,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           loopId,
           goalPreview: input.goal ? redact(input.goal).slice(0, 1000) : undefined,
           projectId: input.projectId,
+          workSessionId,
           mode: input.mode ?? "implement",
           maxTurns,
           turns: [
@@ -1038,17 +1682,37 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               turn,
               at: new Date().toISOString(),
               lastResult: input.lastResult ? redact(input.lastResult).slice(0, 1000) : undefined,
+              currentTask: input.currentTask ? redact(input.currentTask).slice(0, 500) : undefined,
+              completed: input.completed?.map((item) => redact(item).slice(0, 500)),
+              pending: input.pending?.map((item) => redact(item).slice(0, 500)),
+              decisions: input.decisions?.map((decision) => ({
+                summary: redact(decision.summary).slice(0, 500),
+                rationale: decision.rationale ? redact(decision.rationale).slice(0, 1000) : undefined,
+              })),
               nextActions,
             },
           ],
         };
         await writeGoalLoop(ctx, loopId, payload);
+        const taskState = input.projectId
+          ? await recordTaskProgress(ctx, input.projectId, workSessionId, {
+              loopId,
+              ...(input.goal ? { currentGoal: input.goal } : {}),
+              ...(input.currentTask !== undefined ? { currentTask: input.currentTask } : {}),
+              ...(input.lastResult !== undefined ? { lastProgressSummary: input.lastResult } : {}),
+              ...(input.completed !== undefined ? { completed: input.completed } : {}),
+              ...(input.pending !== undefined ? { pending: input.pending } : {}),
+              ...(input.decisions !== undefined ? { decisions: input.decisions } : {}),
+            })
+          : undefined;
         return makeResult(
           {
             loopId,
+            workSessionId,
             turn,
             remainingTurns,
             continueRequired: remainingTurns > 0,
+            taskState,
             nextActions,
             loopRules: [
               "Do one small inspect/edit/verify batch per action round.",
@@ -1290,6 +1954,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Selecting active project...", "Active project selected"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
+        resumeHint: z.string().max(1000).optional(),
+        includeResumeContext: z.boolean().optional(),
+        includeResumeSlice: z.boolean().optional(),
+        maxResumeSliceLines: z.number().int().min(1).max(300).optional(),
+        resumeValidationScope: z.enum(["active", "recent"]).optional(),
         reason: z.string(),
         preset: z.enum(["read-only", "tests-only", "full-write", "image-only", "control"]).optional(),
         confirmSwitch: z.boolean().optional(),
@@ -1309,22 +1979,6 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         const entry = result.entry;
 
-        const session = await loadSession(ctx);
-        if (
-          session.activeProjectId &&
-          session.activeProjectId !== entry.projectId &&
-          session.lease &&
-          Date.now() <= session.lease.expiresAt
-        ) {
-          if (!input.confirmSwitch) {
-            throw new DomainError(
-              ErrorCode.PENDING_WORK_IN_ACTIVE,
-              `Active project "${session.activeProjectId}" has an unexpired lease; pass confirmSwitch=true to switch projects`,
-              { activeProjectId: session.activeProjectId, required: "confirmSwitch" },
-            );
-          }
-        }
-
         const preset: LeasePreset = input.preset ?? "read-only";
         if (preset === "control" && ctx.remote) {
           // Arming a control lease (and resuming after a kill switch, which
@@ -1342,12 +1996,47 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           );
         }
         const lease = makeLease(entry, preset);
-
-        await saveSession(ctx, {
-          activeProjectId: entry.projectId,
-          mode: "read",
-          lease,
+        const updatedSession = await updateSessionState(ctx, async (session) => {
+          if (
+            session.activeProjectId &&
+            session.activeProjectId !== entry.projectId &&
+            session.lease &&
+            Date.now() <= session.lease.expiresAt &&
+            !input.confirmSwitch
+          ) {
+            throw new DomainError(
+              ErrorCode.PENDING_WORK_IN_ACTIVE,
+              `Active project "${session.activeProjectId}" has an unexpired lease; pass confirmSwitch=true to switch projects`,
+              { activeProjectId: session.activeProjectId, required: "confirmSwitch" },
+            );
+          }
+          return {
+            ...session,
+            activeProjectId: entry.projectId,
+            mode: "read",
+            lease,
+          };
         });
+        const rankedCandidates = input.resumeHint
+          ? rankWorkSessions(updatedSession, entry.projectId, input.resumeHint, 3)
+          : [];
+        const candidateDecision = input.workSessionId
+          ? { selected: null, ambiguous: false, reason: "explicit-work-session-id" }
+          : chooseResumeCandidate(rankedCandidates);
+        const resolvedWorkSessionId =
+          input.workSessionId ?? candidateDecision.selected?.workSessionId ?? undefined;
+        const resumableContext = getWorkContext(updatedSession, entry.projectId, resolvedWorkSessionId);
+        const shouldIncludeResumeContext =
+          input.includeResumeContext ?? Boolean(resolvedWorkSessionId && resumableContext);
+        const resumeContext =
+          shouldIncludeResumeContext && resumableContext
+            ? await buildResumeSnapshot(ctx, entry, resumableContext, {
+                includeActiveSlice: input.includeResumeSlice ?? true,
+                maxActiveSliceLines: input.maxResumeSliceLines,
+                validationScope: input.resumeValidationScope ?? "active",
+              })
+            : null;
+        const resumeCandidates = rankedCandidates.map(({ context: _context, ...candidate }) => candidate);
 
         await ctx.ledger.append({
           type: "project.selected",
@@ -1372,9 +2061,140 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               preset: lease.preset,
               expiresAt: lease.expiresAt,
             },
-            instruction: `Active project is now "${entry.name}" (${rulesHint}). Scope confined to ${entry.root}.`,
+            hasRecentContext: resumableContext !== null,
+            workSessionId: resolvedWorkSessionId ?? null,
+            autoResumeApplied: Boolean(!input.workSessionId && candidateDecision.selected),
+            autoResumeAmbiguous: candidateDecision.ambiguous,
+            autoResumeReason: candidateDecision.reason,
+            resumeCandidates,
+            resumeContext,
+            lastActivityAt: resumableContext?.lastActivityAt ?? null,
+            instruction: `Active project is now "${entry.name}" (${rulesHint}). Scope confined to ${entry.root}.${
+              resumeContext
+                ? " Matching recent work context was resolved and hydrated in this response; continue from resumeContext before broad code_search."
+                : candidateDecision.ambiguous
+                  ? " Resume hint matched multiple close candidates; compare resumeCandidates and pass an explicit workSessionId before using task-specific context."
+                  : resumableContext
+                    ? " Recent work context exists; call session_resume with includeActiveSlice=true before broad code_search on follow-up work."
+                    : ""
+            }`,
           },
           `Selected project ${entry.name} with preset ${preset}.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "work_session_list",
+    {
+      title: "List project work sessions",
+      description:
+        "List isolated work-session handles recorded for a project and rank likely resume candidates. Pass hint from the user's follow-up when available.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Listing work sessions...", "Work sessions loaded"),
+      inputSchema: {
+        projectId: z.string(),
+        hint: z.string().max(1000).optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "work_session_list", input, async () => {
+        const session = await loadSession(ctx);
+        const allContexts = Object.values(session.workSessions[input.projectId] ?? {});
+        const workSessions = rankWorkSessions(session, input.projectId, input.hint, input.limit ?? 10).map(
+          ({ context: _context, ...candidate }) => candidate,
+        );
+        const suggestedWorkSessionId = workSessions[0]?.workSessionId ?? null;
+        return makeResult(
+          {
+            projectId: input.projectId,
+            hintApplied: Boolean(input.hint?.trim()),
+            retentionLimit: MAX_WORK_SESSIONS_PER_PROJECT,
+            totalWorkSessions: allContexts.length,
+            suggestedWorkSessionId,
+            workSessions,
+          },
+          `Found ${allContexts.length} isolated work session(s) for ${input.projectId}; suggested ${suggestedWorkSessionId ?? "none"}.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "session_resume",
+    {
+      title: "Resume recent project work",
+      description:
+        "Load the active project's recent work context and validate stored file hashes before reusing it. Optionally hydrate the remembered active line range from disk in the same call. Returns stale=true for files changed outside chatgpt2codex.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Resuming recent work...", "Recent work context loaded"),
+      inputSchema: {
+        projectId: z.string().optional(),
+        workSessionId: WorkSessionIdSchema.optional(),
+        includeActiveSlice: z.boolean().optional(),
+        maxActiveSliceLines: z.number().int().min(1).max(300).optional(),
+        validationScope: z.enum(["active", "recent"]).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "session_resume", input, async () => {
+        const session = await loadSession(ctx);
+        if (!session.activeProjectId) {
+          return makeResult(
+            { activeProjectId: null, hasContext: false, activeArtifact: null, recentFiles: [] },
+            "No active project session to resume.",
+          );
+        }
+        if (input.projectId && input.projectId !== session.activeProjectId) {
+          return makeResult(
+            {
+              activeProjectId: session.activeProjectId,
+              requestedProjectId: input.projectId,
+              hasContext: false,
+              mismatch: true,
+              activeArtifact: null,
+              recentFiles: [],
+            },
+            `Active session belongs to ${session.activeProjectId}; ${input.projectId} was requested.`,
+          );
+        }
+
+        const entry = await resolveOrThrow(ctx, { projectId: session.activeProjectId });
+        const workContext = getWorkContext(session, session.activeProjectId, input.workSessionId);
+        if (!workContext) {
+          return makeResult(
+            {
+              activeProjectId: session.activeProjectId,
+              workSessionId: input.workSessionId ?? null,
+              hasContext: false,
+              activeArtifact: null,
+              recentFiles: [],
+            },
+            `Project ${entry.name} is active, but no recent work context has been recorded yet.`,
+          );
+        }
+
+        const snapshot = await buildResumeSnapshot(ctx, entry, workContext, {
+          includeActiveSlice: input.includeActiveSlice,
+          maxActiveSliceLines: input.maxActiveSliceLines,
+          validationScope: input.validationScope,
+        });
+        return makeResult(
+          {
+            activeProjectId: session.activeProjectId,
+            workSessionId: input.workSessionId ?? workContext.workSessionId,
+            hasContext: true,
+            ...snapshot,
+          },
+          snapshot.activeArtifactStale
+            ? snapshot.activeSlice
+              ? `Recent work loaded for ${entry.name}; active artifact ${workContext.activeArtifact} changed since the stored snapshot, and its remembered range was freshly hydrated from disk.`
+              : `Recent work loaded for ${entry.name}; active artifact ${workContext.activeArtifact} is stale and should be re-read before editing.`
+            : snapshot.activeSlice
+              ? `Recent work loaded for ${entry.name}; stored hashes were validated and the active range was freshly hydrated from disk.`
+              : `Recent work loaded for ${entry.name}; stored hashes were validated before reuse.`,
         );
       });
     },
@@ -1564,6 +2384,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Reading file slice...", "File slice loaded"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         path: z.string(),
         start: z.number().int().min(1).optional(),
         end: z.number().int().optional(),
@@ -1577,6 +2398,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         await guardSecretPath(ctx, abs, "file_read_slice");
         const start = input.start ?? (input.offset !== undefined ? input.offset + 1 : undefined);
         const slice = await readSlice(entry.root, input.path, start, input.end);
+        await recordRecentWork(ctx, {
+          projectId: input.projectId,
+          workSessionId: input.workSessionId,
+          path: input.path,
+          fileHash: await hashProjectFile(entry.root, input.path),
+          lastAction: "read",
+          start: slice.start,
+          end: slice.end,
+        });
         return makeResult(
           { ...slice, content: redact(slice.content) },
           `Read ${input.path} lines ${slice.start}-${slice.end}.`,
@@ -1598,6 +2428,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Applying file patch...", "File patch applied"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         patch: z.string(),
         preconditionHashes: z.record(z.string(), z.string()).optional(),
       },
@@ -1609,6 +2440,37 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const result = await applyPatch(entry.root, input.patch, input.preconditionHashes);
         const checkpoint = await createCheckpoint(entry.root, input.projectId, "patch");
         const checkpointId = checkpoint.checkpointId;
+        for (const applied of result.applied) {
+          const fileHash = applied.action === "delete" || applied.action === "move"
+            ? null
+            : await hashProjectFile(entry.root, applied.path);
+          const lastAction: RecentWorkFile["lastAction"] =
+            applied.action === "add"
+              ? "create"
+              : applied.action === "update"
+                ? "edit"
+                : applied.action === "move"
+                  ? "move"
+                  : "delete";
+          await recordRecentWork(ctx, {
+            projectId: input.projectId,
+            workSessionId: input.workSessionId,
+            path: applied.path,
+            fileHash,
+            lastAction,
+            checkpointId,
+          });
+        }
+        await recordLastMutation(ctx, input.projectId, input.workSessionId, {
+          checkpointId,
+          tool: "file_apply_patch",
+          files: result.applied.map((applied) => ({
+            path: applied.path,
+            action: applied.action as MutationFileSummary["action"],
+            added: applied.added,
+            removed: applied.removed,
+          })),
+        });
         await ctx.ledger.append({
           type: "fs.mutation.staged",
           projectId: input.projectId,
@@ -1640,6 +2502,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Creating project file...", "Project file created"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         path: z.string(),
         content: z.string(),
         overwrite: z.boolean().optional(),
@@ -1652,6 +2515,19 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const result = await createFile(entry.root, input.path, input.content, input.overwrite);
         const checkpoint = await createCheckpoint(entry.root, input.projectId, "create");
         const checkpointId = checkpoint.checkpointId;
+        await recordRecentWork(ctx, {
+          projectId: input.projectId,
+          workSessionId: input.workSessionId,
+          path: result.path,
+          fileHash: await hashProjectFile(entry.root, result.path),
+          lastAction: "create",
+          checkpointId,
+        });
+        await recordLastMutation(ctx, input.projectId, input.workSessionId, {
+          checkpointId,
+          tool: "file_create",
+          files: [{ path: result.path, action: "create" }],
+        });
         await ctx.ledger.append({
           type: "fs.mutation.staged",
           projectId: input.projectId,
@@ -1697,6 +2573,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Running project command...", "Project command finished"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         commandId: z.string(),
         args: z.array(z.string()).optional(),
         intent: z
@@ -1726,6 +2603,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           input.args,
           input.intent?.expectedDurationSec,
         );
+        if (commandForPolicy?.riskTier === "verify") {
+          await recordVerification(ctx, input.projectId, input.workSessionId, {
+            tool: "command_run",
+            command: [input.commandId, ...(input.args ?? [])].join(" ").slice(0, 500),
+            success: result.exitCode === 0,
+            exitCode: result.exitCode,
+            durationMs: result.durationMs,
+          });
+        }
         await ctx.ledger.append({
           type: "process.output.redacted",
           projectId: input.projectId,
@@ -1756,6 +2642,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Running local shell...", "Local shell finished"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         command: z.string(),
         cwd: z.string().optional(),
         timeoutSec: z.number().int().positive().max(900).optional(),
@@ -1783,6 +2670,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           shell: true,
         });
         const result = await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec);
+        if (!input.intent?.writesWorkspace) {
+          await recordVerification(ctx, input.projectId, input.workSessionId, {
+            tool: "local_shell_run",
+            command: redact(input.command).slice(0, 500),
+            success: result.exitCode === 0,
+            exitCode: result.exitCode,
+            durationMs: result.durationMs,
+          });
+        }
         await ctx.ledger.append({
           type: "process.output.redacted",
           projectId: input.projectId,
@@ -1814,6 +2710,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Starting E2E server...", "E2E server started"),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         command: z.string(),
         cwd: z.string().optional(),
         label: z.string().optional(),
@@ -1925,6 +2822,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Running E2E command...", "E2E command finished", E2E_WIDGET_TOOL_META),
       inputSchema: {
         projectId: z.string(),
+        workSessionId: WorkSessionIdSchema.optional(),
         command: z.string(),
         cwd: z.string().optional(),
         timeoutSec: z.number().int().min(1).max(900).optional(),
@@ -1988,6 +2886,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           exitCode: result.exitCode,
           screenshotPath: screenshot?.path,
         });
+        await recordVerification(ctx, input.projectId, input.workSessionId, {
+          tool: "e2e_run_command",
+          command: redact(input.command).slice(0, 500),
+          success: result.exitCode === 0,
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+        });
         return withE2eImageContent(
           makeResult(
             {
@@ -2012,11 +2917,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "E2E test and show screenshot",
       description:
-        "One-shot local E2E proof tool. Call immediately when the user says 'e2e 테스트하고 스크린샷 보여줘' or 'run e2e and show me the screenshot'. Uses the active project by default, detects web vs desktop-app projects such as Tauri, runs only discovered local package scripts, opens the built desktop app for Tauri projects, captures multiple top/middle/bottom app-window screenshots for desktop apps or browser-region screenshots for web apps, renders the screenshot set inline in ChatGPT through the E2E screenshot widget, and returns inline image markdown through GPT Actions. If the discovered local check fails, the assistant must inspect logs, make normal code fixes with separate coding tools, rerun E2E, and only then show the final passing screenshot set.",
+        "One-shot local E2E proof tool. Call immediately when the user says 'e2e 테스트하고 스크린샷 보여줘' or 'run e2e and show me the screenshot'. Uses the active project by default, detects web vs desktop-app projects such as Tauri, runs only discovered local package scripts, opens the built desktop app for Tauri projects, and captures visual proof. macOS supports app-window and top/middle/bottom browser-region screenshots; Windows web projects use an installed Edge/Chrome with an isolated profile and capture desktop plus 390x844 mobile top/middle/bottom views. Screenshots render inline in ChatGPT through the E2E screenshot widget and return inline image markdown through GPT Actions. If the discovered local check fails, the assistant must inspect logs, make normal code fixes with separate coding tools, rerun E2E, and only then show the final passing screenshot set.",
       annotations: E2E_ONE_SHOT_ANNOTATIONS,
       _meta: chatGptToolMeta("Running E2E and capturing screenshot...", "E2E screenshot ready", E2E_WIDGET_TOOL_META),
       inputSchema: {
         projectId: z.string().optional(),
+        workSessionId: WorkSessionIdSchema.optional(),
         instruction: z.string().optional(),
         url: z.string().optional(),
         cwd: z.string().optional(),
@@ -2109,6 +3015,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             const screenshotSet = await attachE2eInlineShareSet(ctx, screenshots);
             const screenshot = screenshotSet[0] ?? (await attachE2eInlineShare(ctx, captured, "E2E screenshot"));
             const needsRepair = Boolean(commandResult && commandResult.exitCode !== 0) || Boolean(server?.wait && !server.wait.ok);
+            await recordVerification(ctx, project.projectId, input.workSessionId, {
+              tool: "e2e_test_and_show_screenshot",
+              command: command ? redact(command).slice(0, 500) : "visual-smoke",
+              success: !needsRepair,
+              exitCode: commandResult?.exitCode ?? null,
+              durationMs: commandResult?.durationMs ?? null,
+            });
             await ctx.ledger.append({
               type: "e2e.one_shot.finished",
               projectId: project.projectId,
@@ -2197,7 +3110,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "e2e_open_url_screenshot",
     {
       title: "Open URL and capture E2E screenshot",
-      description: "Open a URL, wait briefly, capture the Mac screen, and return the screenshot path for E2E proof.",
+      description: "Open a local loopback URL, wait briefly, and capture browser E2E proof. macOS captures the visible Chrome region; Windows uses an installed Edge/Chrome headless viewport.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Opening URL and capturing screenshot...", "E2E screenshot captured", E2E_WIDGET_TOOL_META),
       inputSchema: {

@@ -96,6 +96,12 @@ export interface ToolContext {
     saveProjects(p: ProjectRegistryEntry[]): Promise<void>;
     getSession(): Promise<unknown>;
     setSession(s: unknown): Promise<void>;
+    /**
+     * Atomically update session state relative to the latest persisted value.
+     * Real Store implementations should serialize concurrent updates; optional
+     * here so lightweight test doubles and third-party adapters remain compatible.
+     */
+    updateSession?(mutator: (current: unknown) => unknown | Promise<unknown>): Promise<unknown>;
   };
   config: Config;
   /** True for an MCP server instance handed a remote/network transport

@@ -38,7 +38,69 @@ const ProjectsFileSchema = z.object({
 
 type ProjectsFile = z.infer<typeof ProjectsFileSchema>;
 
-/** Session document shape (active project, mode, lease) — PRD §6, §7. */
+const RecentWorkFileSchema = z.object({
+  path: z.string().min(1),
+  fileHash: z.string().nullable(),
+  lastAction: z.enum(["read", "edit", "create", "delete", "move"]),
+  lastTouchedAt: z.number().int().nonnegative(),
+  start: z.number().int().min(1).optional(),
+  end: z.number().int().min(1).optional(),
+});
+
+const MutationFileSchema = z.object({
+  path: z.string().min(1),
+  action: z.enum(["add", "update", "delete", "move", "create"]),
+  added: z.number().int().nonnegative().optional(),
+  removed: z.number().int().nonnegative().optional(),
+});
+
+const LastMutationSchema = z.object({
+  checkpointId: z.string().min(1),
+  tool: z.enum(["file_apply_patch", "file_create"]),
+  files: z.array(MutationFileSchema).max(50),
+  at: z.number().int().nonnegative(),
+});
+
+const LastVerificationSchema = z.object({
+  tool: z.enum(["command_run", "local_shell_run", "e2e_run_command", "e2e_test_and_show_screenshot"]),
+  command: z.string().max(500),
+  success: z.boolean(),
+  exitCode: z.number().int().nullable(),
+  durationMs: z.number().int().nonnegative().nullable(),
+  at: z.number().int().nonnegative(),
+});
+
+const TaskDecisionSchema = z.object({
+  summary: z.string().min(1).max(500),
+  rationale: z.string().max(1000).nullable().default(null),
+  at: z.number().int().nonnegative(),
+});
+
+const TaskStateSchema = z.object({
+  goalId: z.string().nullable().default(null),
+  loopId: z.string().nullable().default(null),
+  currentGoal: z.string().max(1000).nullable().default(null),
+  currentTask: z.string().max(500).nullable().default(null),
+  lastProgressSummary: z.string().max(1000).nullable().default(null),
+  completed: z.array(z.string().min(1).max(500)).max(50).default([]),
+  pending: z.array(z.string().min(1).max(500)).max(50).default([]),
+  decisions: z.array(TaskDecisionSchema).max(30).default([]),
+  updatedAt: z.number().int().nonnegative().default(0),
+});
+
+const WorkContextSchema = z.object({
+  projectId: z.string(),
+  workSessionId: z.string().nullable().default(null),
+  activeArtifact: z.string().nullable(),
+  recentFiles: z.array(RecentWorkFileSchema).max(20),
+  lastCheckpointId: z.string().nullable(),
+  lastMutation: LastMutationSchema.nullable().default(null),
+  lastVerification: LastVerificationSchema.nullable().default(null),
+  taskState: TaskStateSchema.default({}),
+  lastActivityAt: z.number().int().nonnegative(),
+});
+
+/** Session document shape (active project, mode, lease, recent work context) — PRD §6, §7. */
 const SessionSchema = z.object({
   version: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
@@ -54,6 +116,10 @@ const SessionSchema = z.object({
       expiresAt: z.number().int().nonnegative(),
     })
     .nullable(),
+  // Legacy v2 single-project context. Kept readable for migration only.
+  workContext: WorkContextSchema.nullable().default(null),
+  workContexts: z.record(z.string(), WorkContextSchema).default({}),
+  workSessions: z.record(z.string(), z.record(z.string(), WorkContextSchema)).default({}),
 });
 
 export type SessionDocument = z.infer<typeof SessionSchema>;
@@ -64,17 +130,25 @@ const FILE_MODE = 0o600;
 const PROJECTS_FILE = "projects.json";
 const SESSIONS_FILE = "sessions.json";
 
+// Serialize session read-modify-write operations per state directory. A
+// module-level queue also coordinates multiple Store instances in the same
+// runtime process that point at the same persisted session file.
+const sessionWriteQueues = new Map<string, Promise<void>>();
+
 function emptyProjectsFile(): ProjectsFile {
   return { version: 1, updatedAt: Date.now(), projects: [] };
 }
 
 function emptySession(): SessionDocument {
   return {
-    version: 1,
+    version: 5,
     updatedAt: Date.now(),
     activeProjectId: null,
     mode: "observe",
     lease: null,
+    workContext: null,
+    workContexts: {},
+    workSessions: {},
   };
 }
 
@@ -164,17 +238,69 @@ export class Store {
         `Store: ${SESSIONS_FILE} failed validation: ${parsed.error.message}`,
       );
     }
-    return parsed.data;
+    const session = parsed.data;
+    if (session.workContext && Object.keys(session.workContexts).length === 0) {
+      return {
+        ...session,
+        workContexts: { [session.workContext.projectId]: session.workContext },
+      };
+    }
+    return session;
   }
 
-  async setSession(s: unknown): Promise<void> {
+  private normalizeSession(s: unknown): SessionDocument {
     const merged = {
       ...emptySession(),
       ...(typeof s === "object" && s !== null ? s : {}),
     };
+    // Writes always migrate the persisted session to the latest schema version.
+    // If a v2 caller still supplies the old single workContext, preserve it in
+    // the per-project map before clearing the legacy field.
+    if (merged.workContext && Object.keys(merged.workContexts).length === 0) {
+      merged.workContexts = { [merged.workContext.projectId]: merged.workContext };
+    }
+    merged.workContext = null;
+    merged.version = 5;
     // updatedAt is always server-recomputed, never trusted from caller input.
     merged.updatedAt = Date.now();
-    const validated = SessionSchema.parse(merged);
+    return SessionSchema.parse(merged);
+  }
+
+  private async writeSessionNow(s: unknown): Promise<SessionDocument> {
+    const validated = this.normalizeSession(s);
     await this.atomicWriteJson(SESSIONS_FILE, validated);
+    return validated;
+  }
+
+  private enqueueSessionWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = sessionWriteQueues.get(this.stateDir) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(operation);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    sessionWriteQueues.set(this.stateDir, tail);
+    void tail.then(() => {
+      if (sessionWriteQueues.get(this.stateDir) === tail) {
+        sessionWriteQueues.delete(this.stateDir);
+      }
+    });
+    return run;
+  }
+
+  async setSession(s: unknown): Promise<void> {
+    await this.enqueueSessionWrite(async () => {
+      await this.writeSessionNow(s);
+    });
+  }
+
+  async updateSession(
+    mutator: (current: SessionDocument) => unknown | Promise<unknown>,
+  ): Promise<SessionDocument> {
+    return this.enqueueSessionWrite(async () => {
+      const current = await this.getSession();
+      const next = await mutator(current);
+      return this.writeSessionNow(next);
+    });
   }
 }

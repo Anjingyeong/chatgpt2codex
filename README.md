@@ -10,12 +10,21 @@ ChatGPT To Codex is a local MCP and Actions runtime for macOS and Windows that l
 work inside the project folder you choose: read files, search code, apply
 patches, run tests, launch E2E checks, and send back screenshot proof.
 
-Your source stays on your machine. ChatGPT connects to the local app you run.
-You choose the workspace, approve the token, and keep control of what gets
-edited.
+Unlike coding-agent runtimes that embed their own LLM client, ChatGPT To Codex
+does **not** call an LLM API itself. ChatGPT remains the reasoning engine; this
+project supplies the local execution harness. That means you do not need a
+separate OpenAI/Anthropic/Gemini API key or a second per-token API billing path
+just to give ChatGPT local coding tools. Model usage still follows the limits
+and terms of the ChatGPT plan/model you are using.
+
+Your repository is not uploaded wholesale to a separate agent service. The local
+runtime reads files on your machine and sends only the tool results/context that
+ChatGPT needs for the task. You choose the workspace, approve the connector, and
+keep control of what gets edited.
 
 [Download v0.2.0](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0) ·
-[Beginner installation guide](docs/INSTALL.md)
+[Beginner installation guide](docs/INSTALL.md) ·
+[Harness engineering dev log](docs/HARNESS_DEVLOG.md)
 
 > Help us get this in front of more builders: star the repo if you want
 > ChatGPT to stop talking about code and start safely doing the repo loop.
@@ -29,7 +38,7 @@ ChatGPT To Codex fills that gap:
 - local project selection instead of uploading a source tree
 - guarded file reads and hash-checked patching
 - allowlisted local commands for tests and checks
-- macOS/Windows app, window, and browser screenshot capture for visual E2E proof
+- macOS app/window/browser screenshots plus Windows local-web browser screenshots for visual E2E proof
 - temporary or fixed HTTPS connector URL for ChatGPT web
 - OAuth-style owner-token approval so random clients cannot just attach
 - multilingual menu bar app for non-English users
@@ -39,6 +48,78 @@ The mental model is simple:
 ```text
 ChatGPT thinks. Your computer acts. You review the result.
 ```
+
+## Why This Is Different
+
+Most agent frameworks own both sides of the loop: they call an LLM provider and
+then execute tools. ChatGPT To Codex deliberately owns only the local side.
+
+```text
+Typical coding-agent runtime
+
+User -> agent runtime -> LLM API -> agent runtime -> local tools
+
+ChatGPT To Codex
+
+User -> ChatGPT -> MCP / Actions -> local runtime -> files / shell / git / E2E
+```
+
+That separation gives the project a different trade-off:
+
+- reuse the ChatGPT account and model surface you already use
+- no embedded LLM provider SDK or separate model-routing layer in this runtime
+- no separate per-token API billing path created by ChatGPT To Codex itself
+- local filesystem, shell, git, tests, browser proof, and approvals stay in a
+  small auditable execution layer
+- ChatGPT conversation history and the local coding-session state remain
+  separate; the runtime does not scrape or read all of your ChatGPT chats
+
+This is not "tokenless AI." ChatGPT still performs model inference. The point is
+that the local harness does not add another LLM API account, key, or metered
+agent loop on top.
+
+## Persistent Work Sessions
+
+Recent harness work focuses on making follow-up coding requests feel like a
+continuation instead of a fresh repo investigation every time.
+
+The runtime can now keep project-scoped and work-session-scoped state such as:
+
+- active artifact and recently touched files
+- current goal and current task
+- completed and pending work
+- important implementation decisions
+- last mutation/checkpoint
+- last verification result
+- remembered line ranges for fast source hydration
+
+`workSessionId` isolates multiple tasks inside the same repository, while
+resume hints can rank likely sessions when you say things such as "continue the
+portfolio work from earlier."
+
+Fast resume is designed to stay safe rather than blindly trust cached state:
+
+```text
+resume
+-> validate the active artifact
+-> hydrate the latest source slice from disk
+-> return the current full-file SHA-256
+-> use it as a CAS-style patch precondition
+-> reject the patch if the file changed in between
+```
+
+Other recent harness improvements include bounded-parallel hash validation,
+active-first lazy validation for fast resume, same-process session-update
+serialization, LRU retention for work sessions, and fused
+`project_select + session ranking + resume` flows when the match is confident.
+
+On a source checkout, the Windows development launcher also detects the repo's
+latest `dist/cli.js` and rebuilds automatically when source files are newer, so
+developers no longer need to rebuild the portable Windows package after every
+runtime change.
+
+The implementation history, failed approaches, validation results, and design
+trade-offs are tracked in [docs/HARNESS_DEVLOG.md](docs/HARNESS_DEVLOG.md).
 
 ## Current Release
 

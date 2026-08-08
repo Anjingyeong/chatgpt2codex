@@ -1,9 +1,10 @@
 import { promises as fs } from "node:fs";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DomainError, ErrorCode } from "../types.js";
-import { captureE2eUrlScreenshot, openE2eTarget } from "./local-e2e.js";
+import { captureE2eUrlScreenshot, captureE2eUrlScreenshotSet, openE2eTarget } from "./local-e2e.js";
 
 /**
  * captureE2eUrlScreenshot/openE2eTarget drive the owner's real, authenticated
@@ -49,6 +50,118 @@ describe("captureE2eUrlScreenshot URL guard", () => {
 
   it("still throws a typed DomainError (not a raw string) for a rejected URL", async () => {
     await expect(captureE2eUrlScreenshot(projectRoot, { url: "file:///etc/passwd" })).rejects.toBeInstanceOf(DomainError);
+  });
+
+  const windowsIt = process.platform === "win32" ? it : it.skip;
+  windowsIt("captures a loopback page with installed Edge/Chrome on Windows", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end("<!doctype html><html><body><h1>Windows E2E Screenshot</h1></body></html>");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
+      const url = `http://127.0.0.1:${address.port}/`;
+      const result = await captureE2eUrlScreenshot(projectRoot, {
+        url,
+        label: "windows-loopback",
+        waitMs: 250,
+        width: 800,
+        height: 600,
+      });
+
+      expect(result.captureMode).toBe("browser-region");
+      expect(result.targetUrl).toBe(url);
+      expect(result.bytes).toBeGreaterThan(0);
+      const signature = (await fs.readFile(result.path)).subarray(0, 8).toString("hex");
+      expect(signature).toBe("89504e470d0a1a0a");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  windowsIt("captures desktop and mobile top/middle/bottom screenshot sets on Windows", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(`<!doctype html>
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="margin:0">
+          <section style="height:1100px;background:#eee"><h1>Top</h1></section>
+          <section style="height:1100px;background:#ccc"><h1>Middle</h1></section>
+          <section style="height:1100px;background:#aaa"><h1>Bottom</h1></section>
+        </body></html>`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
+      const url = `http://127.0.0.1:${address.port}/`;
+      const results = await captureE2eUrlScreenshotSet(projectRoot, {
+        url,
+        label: "windows-set",
+        waitMs: 100,
+        width: 900,
+        height: 600,
+      });
+
+      expect(results.map((result) => result.shotLabel)).toEqual([
+        "desktop-top",
+        "desktop-middle",
+        "desktop-bottom",
+        "mobile-top",
+        "mobile-middle",
+        "mobile-bottom",
+      ]);
+      for (const result of results) {
+        const png = await fs.readFile(result.path);
+        expect(png.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+        const expected = result.shotLabel?.startsWith("mobile-") ? { width: 390, height: 844 } : { width: 900, height: 600 };
+        expect({ width: png.readUInt32BE(16), height: png.readUInt32BE(20) }).toEqual(expected);
+        const preview = await fs.readFile(`${result.path.slice(0, -4)}-preview.jpg`);
+        expect(preview.subarray(0, 2).toString("hex")).toBe("ffd8");
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  windowsIt("collects browser console and network failures on Windows", async () => {
+    const server = createServer((request, response) => {
+      if (request.url === "/missing") {
+        response.writeHead(404, { "content-type": "text/plain" });
+        response.end("missing");
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(`<!doctype html><html><body><h1>Diagnostics</h1><script>
+        console.error("diagnostic-console-error");
+        fetch("/missing").catch(() => {});
+      </script></body></html>`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
+      const url = `http://127.0.0.1:${address.port}/`;
+      const result = await captureE2eUrlScreenshot(projectRoot, { url, waitMs: 250 });
+      expect(result.diagnostics?.consoleErrors.some((entry) => entry.includes("diagnostic-console-error"))).toBe(true);
+      expect(result.diagnostics?.failedRequests.some((entry) => entry.includes("404") && entry.includes("/missing"))).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 

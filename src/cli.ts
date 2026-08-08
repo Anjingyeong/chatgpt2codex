@@ -101,6 +101,7 @@ async function buildToolContext(workspace: string): Promise<ToolContext> {
       saveProjects: (p) => store.saveProjects(p),
       getSession: () => store.getSession(),
       setSession: (s) => store.setSession(s),
+      updateSession: (mutator) => store.updateSession(mutator),
     },
     config,
   };
